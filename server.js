@@ -32,7 +32,7 @@ async function fetchWithTimeout(url, options = {}, timeout = 25000) {
     }
 }
 
-// 1. הורדת הקלטה מימות המשיח (מהירה וממוקדת)
+// 1. הורדת ההקלטה מימות המשיח
 async function downloadRecordingFromYemot(recordPath, apiDir) {
     const cleanPath = String(recordPath).replace(/^ivr2:\/*/, '').replace(/^\/*/, '');
     const cleanDir = String(apiDir || '').replace(/^ivr2:\/*/, '').replace(/^\/*/, '').replace(/\/*$/, '');
@@ -78,7 +78,7 @@ async function downloadRecordingFromYemot(recordPath, apiDir) {
     throw new Error('YEMOT_DOWNLOAD_ERR: ' + lastYemotResponse);
 }
 
-// 2. בחירת המודל המהיר והזמין בחשבון (תומך ב-gemini-3.5-flash ו-gemini-flash-lite-latest ללא עיכוב חשיבה)
+// 2. בחירת המודל המהיר לתמלול ב-Gemini
 async function getFastGeminiModels() {
     const defaultFastOrder = [
         'gemini-flash-lite-latest',
@@ -99,8 +99,6 @@ async function getFastGeminiModels() {
                 .filter(m => (m.supportedGenerationMethods || []).includes('generateContent'))
                 .map(m => m.name.replace('models/', ''))
                 .filter(m => !m.includes('2.5') && !m.includes('1.5') && !m.includes('tts') && !m.includes('image') && !m.includes('robotics') && !m.includes('research') && !m.includes('computer-use'));
-
-            console.log('[Gemini] Filtered fast models for key:', available.join(', '));
 
             const matched = [];
             for (const pref of defaultFastOrder) {
@@ -168,43 +166,170 @@ async function transcribeAudio(audioBase64) {
     throw new Error('GEMINI_ERR: ' + lastErr);
 }
 
-app.get('/', (req, res) => { res.send('YouTube Line Server v6.0 OK - Fast Audio Transcription'); });
-
-// נתיב הזרמה ישיר בפורמט MP3 ו-WAV
-app.get('/stream/:videoId.:ext', (req, res) => {
-    const { videoId, ext } = req.params;
-    if (!videoId) return res.status(400).end();
-
-    const isWav = ext === 'wav';
-    res.setHeader('Content-Type', isWav ? 'audio/wav' : 'audio/mpeg');
-    
-    const subprocess = ytDlp.exec(`https://www.youtube.com/watch?v=${videoId}`, {
-        output: '-',
-        format: 'bestaudio/best',
-        noWarnings: true,
-        noCheckCertificates: true,
-        extractorArgs: 'youtube:player_client=android,web'
-    }, { stdio: ['ignore', 'pipe', 'ignore'] });
-
-    const proc = ffmpeg(subprocess.stdout)
-        .audioChannels(1)
-        .audioFrequency(isWav ? 8000 : 16000);
-
-    if (isWav) {
-        proc.format('wav').audioCodec('pcm_s16le');
-    } else {
-        proc.format('mp3').audioCodec('libmp3lame').audioBitrate('32k');
+// 3. חילוץ קישור שמע משרתי גיבוי אם ה-IP של Render נחסם ביוטיוב
+async function getBackupAudioStreamUrl(videoId) {
+    const pipedInstances = [
+        'https://pipedapi.kavin.rocks',
+        'https://pipedapi.tokhmi.xyz',
+        'https://pipedapi.moomoo.me',
+        'https://api.piped.private.coffee'
+    ];
+    for (const api of pipedInstances) {
+        try {
+            const res = await fetchWithTimeout(`${api}/streams/${videoId}`, {
+                headers: { 'User-Agent': 'Mozilla/5.0' }
+            }, 6000);
+            if (res.ok) {
+                const data = await res.json();
+                const streams = data.audioStreams || [];
+                if (streams.length > 0) {
+                    streams.sort((a, b) => (a.bitrate || 999999) - (b.bitrate || 999999));
+                    if (streams[0].url) {
+                        console.log(`[Audio Backup] Found stream via ${api}`);
+                        return streams[0].url;
+                    }
+                }
+            }
+        } catch (e) {}
     }
+    return null;
+}
 
-    proc.on('error', (err) => {
-        console.error('[Stream] Error:', err.message);
-        if (!res.headersSent) res.status(500).end();
-    }).pipe(res, { end: true });
+// 4. המרת שמע לקובץ WAV תקני של ימות המשיח (8000Hz, Mono, 16-bit PCM)
+async function convertStreamToWav(inputSource, outputWavPath, maxDurationSec = 600) {
+    return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+            reject(new Error('FFmpeg conversion timed out'));
+        }, 20000);
 
-    req.on('close', () => {
-        try { subprocess.kill(); } catch (e) {}
+        ffmpeg(inputSource)
+            .format('wav')
+            .audioCodec('pcm_s16le')
+            .audioChannels(1)
+            .audioFrequency(8000)
+            .duration(maxDurationSec)
+            .on('end', () => {
+                clearTimeout(timer);
+                resolve();
+            })
+            .on('error', (err) => {
+                clearTimeout(timer);
+                reject(err);
+            })
+            .save(outputWavPath);
     });
-});
+}
+
+// 5. הורדה, המרה והעלאה ישירה לימות המשיח (UploadFile) כדי שהקובץ יתנגן כקובץ מערכת מקומי ללא שגיאות!
+async function downloadAndUploadToYemot(videoId, apiExtension) {
+    const tmpWav = path.join(os.tmpdir(), `ym_${videoId}_${Date.now()}.wav`);
+    const extFolder = String(apiExtension || '9').replace(/^ivr2:\/*/, '').replace(/^\/*/, '').replace(/\/*$/, '');
+    
+    // העלאה ישירות לקובץ 100.wav בתוך השלוחה
+    const yemotTargetPath = extFolder ? `ivr2:/${extFolder}/100.wav` : `ivr2:/100.wav`;
+    const playFileCommand = extFolder ? `f-/${extFolder}/100` : `f-/100`;
+
+    try {
+        let converted = false;
+
+        // ניסיון 1: הזרמה ישירה מ-yt-dlp לתוך FFmpeg עם פרופילים עוקפי חסימה
+        const clientProfiles = [
+            'youtube:player_client=android,web',
+            'youtube:player_client=ios,web',
+            'youtube:player_client=tv_embedded,web'
+        ];
+
+        for (const profile of clientProfiles) {
+            if (converted) break;
+            try {
+                console.log(`[Step 5 Audio] Extracting ${videoId} with profile: ${profile}`);
+                await new Promise((resolve, reject) => {
+                    const subprocess = ytDlp.exec(`https://www.youtube.com/watch?v=${videoId}`, {
+                        output: '-',
+                        format: 'worstaudio[ext=m4a]/worstaudio/bestaudio',
+                        noWarnings: true,
+                        noCheckCertificates: true,
+                        extractorArgs: profile
+                    }, { stdio: ['ignore', 'pipe', 'pipe'] });
+
+                    let stderrLog = '';
+                    subprocess.stderr.on('data', d => { stderrLog += d.toString(); });
+
+                    const timeoutId = setTimeout(() => {
+                        try { subprocess.kill(); } catch (e) {}
+                        reject(new Error('yt-dlp pipe timeout'));
+                    }, 18000);
+
+                    ffmpeg(subprocess.stdout)
+                        .format('wav')
+                        .audioCodec('pcm_s16le')
+                        .audioChannels(1)
+                        .audioFrequency(8000)
+                        .duration(480) // 8 דקות ראשונות לטעינה מהירה במיוחד בזמן השיחה
+                        .on('end', () => {
+                            clearTimeout(timeoutId);
+                            try { subprocess.kill(); } catch (e) {}
+                            resolve();
+                        })
+                        .on('error', (err) => {
+                            clearTimeout(timeoutId);
+                            try { subprocess.kill(); } catch (e) {}
+                            reject(new Error(err.message + ' | stderr: ' + stderrLog.slice(-200)));
+                        })
+                        .save(tmpWav);
+                });
+
+                if (fs.existsSync(tmpWav) && fs.statSync(tmpWav).size > 4000) {
+                    converted = true;
+                }
+            } catch (err) {
+                console.warn(`[Step 5 Audio] Profile ${profile} failed:`, err.message);
+            }
+        }
+
+        // ניסיון 2: שרתי גיבוי (Piped) אם ה-IP של Render חסום ביוטיוב
+        if (!converted) {
+            console.log('[Step 5 Audio] Trying backup Piped stream...');
+            const backupUrl = await getBackupAudioStreamUrl(videoId);
+            if (backupUrl) {
+                await convertStreamToWav(backupUrl, tmpWav, 480);
+                if (fs.existsSync(tmpWav) && fs.statSync(tmpWav).size > 4000) {
+                    converted = true;
+                }
+            }
+        }
+
+        if (!converted) {
+            throw new Error('Could not extract audio from YouTube (IP blocked or restricted video)');
+        }
+
+        const wavBuffer = await fs.promises.readFile(tmpWav);
+        console.log(`[Step 5 Upload] WAV ready (${wavBuffer.length} bytes). Uploading to ${yemotTargetPath}...`);
+
+        const formData = new FormData();
+        formData.append('token', TOKEN);
+        formData.append('path', yemotTargetPath);
+        formData.append('convertAudio', '0');
+        formData.append('file', new Blob([wavBuffer], { type: 'audio/wav' }), '100.wav');
+
+        const upRes = await fetchWithTimeout(`${YM}UploadFile`, {
+            method: 'POST',
+            body: formData
+        }, 20000);
+
+        const upText = await upRes.text();
+        console.log('[Step 5 Upload] Yemot response:', upText.slice(0, 200));
+
+        fs.promises.unlink(tmpWav).catch(() => null);
+        return playFileCommand;
+
+    } catch (e) {
+        fs.promises.unlink(tmpWav).catch(() => null);
+        throw e;
+    }
+}
+
+app.get('/', (req, res) => { res.send('YouTube Line Server v7.0 OK - Direct Yemot Upload'); });
 
 app.all(['/yemot', '/yemot/:e'], async (req, res) => {
     const q = { ...req.query, ...req.body };
@@ -215,8 +340,7 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
     try {
         if (q.hangup === 'yes') return res.send('noop');
 
-        // שלב 1: בקשת הקלטה עם תחביר תקני ומדויק של ימות המשיח (ללא דריסת שם הקובץ ל-no.wav!)
-        // פרמטרים: RecordPath, use_existing(no), record, folder, filename, no_confirm(no), max_sec(7), min_sec(1)
+        // שלב 1: בקשת הקלטה
         if (!q.RecordPath) {
             return res.send('read=t-אנא אמרו את שם השיעור המבוקש ובסיום הקישו סולמית=RecordPath,no,record,,,no,7,1');
         }
@@ -248,7 +372,7 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
 
         // שלב 4: חיפוש ב-YouTube API
         const ytUrl = `https://www.googleapis.com/youtube/v3/search?part=snippet&q=${encodeURIComponent(cleanQuery)}&type=video&maxResults=1&key=${YT_KEY}`;
-        const ytRes = await fetchWithTimeout(ytUrl, {}, 12000);
+        const ytRes = await fetchWithTimeout(ytUrl, {}, 10000);
         const ytData = await ytRes.json();
 
         if (!ytRes.ok) {
@@ -264,14 +388,18 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
         const title = (ytData.items[0].snippet.title || '').replace(/[^א-תa-zA-Z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
         console.log(`[Step 4 Match] Video ${videoId}: ${title}`);
 
-        // שלב 5: השמעת התוצאה
-        const hostUrl = `https://${req.get('host')}`;
-        const streamUrl = `${hostUrl}/stream/${videoId}.mp3`;
-
-        return res.send(`id_list_message=t-משמיע ${title}.f-${streamUrl}&go_to_folder=/`);
+        // שלב 5: הורדה, המרה ל-WAV והעלאה ישירות לשלוחה בימות המשיח!
+        try {
+            const playCmd = await downloadAndUploadToYemot(videoId, q.ApiExtension);
+            console.log(`[Step 5 Ready] Sending play command: ${playCmd}`);
+            return res.send(`id_list_message=t-משמיע ${title}.${playCmd}&go_to_folder=/`);
+        } catch (audioErr) {
+            console.error('[Step 5 Error]', audioErr.message);
+            return res.send(`id_list_message=t-נמצא השיעור ${title} אך שרת יוטיוב חסם את הורדת השמע&go_to_folder=/`);
+        }
 
     } catch (e) {
-        console.error('[General Error v6.0]', e.message);
+        console.error('[General Error v7.0]', e.message);
         if (!res.headersSent) {
             return res.send('id_list_message=t-אירעה תקלה כללית בשרת&go_to_folder=/');
         }
@@ -279,4 +407,4 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
 });
 
 const port = process.env.PORT || 3000;
-app.listen(port, () => console.log(`=== Server v6.0 Ready on port ${port} ===`));
+app.listen(port, () => console.log(`=== Server v7.0 Ready on port ${port} ===`));
