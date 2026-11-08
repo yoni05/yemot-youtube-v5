@@ -16,18 +16,18 @@ const TOKEN = (process.env.YEMOT_TOKEN || '').trim();
 const GEMINI_KEY = (process.env.GEMINI_API_KEY || '').trim();
 const YT_KEY = (process.env.YOUTUBE_API_KEY || '').trim();
 const YM = 'https://www.call2all.co.il/ym/api/';
-const ARCHIVE_EXT = '8'; // שלוחה 8 לשמירת כל ההקלטות וההשמעות לתמיד
+const TEXT_ARCHIVE_EXT = '8'; // שלוחה 8 מיועדת לשמירת קובצי הטקסט של זיהוי הדיבור
 
 let cachedModelName = null;
 
-// זיכרון לשמירת ההורדה הקודמת של כל מתקשר (וגם ההורדה האחרונה הכללית בקו)
+// זיכרון לשמירת ההורדה הקודמת של כל מתקשר
 const lastDownloadByPhone = new Map();
 let globalLastDownload = null;
 
-// מונים מקומיים לכל תיקייה כדי להבטיח שאפילו שני קבצים שעולים באותה שנייה בדיוק יקבלו מספר עוקב שונה ולעולם לא ידרסו זה את זה!
+// מונים מקומיים לכל תיקייה למניעת דריסת קבצים
 const folderCounters = {};
 
-async function fetchWithTimeout(url, options = {}, timeout = 20000) {
+async function fetchWithTimeout(url, options = {}, timeout = 25000) {
     const controller = new AbortController();
     const id = setTimeout(() => controller.abort(), timeout);
     try {
@@ -40,8 +40,7 @@ async function fetchWithTimeout(url, options = {}, timeout = 20000) {
     }
 }
 
-// פונקציה שבודקת מול ימות המשיח מהו מספר הקובץ הגבוה ביותר בתיקייה ומחזירה את המספר הפנוי הבא (למשל "000", "001", "002"...)
-// כך שאנו נותנים לכל קובץ שם מפורש וייחודי בעצמנו, ואף קובץ לעולם לא נדרס!
+// פונקציה שבודקת מול ימות המשיח מהו מספר הקובץ הגבוה ביותר בתיקייה (בודק גם wav, גם tts וגם txt)
 async function getNextFileNumberStr(folder, reserveCount = 1) {
     const cleanFolder = String(folder || '').replace(/^ivr2:\/*/, '').replace(/^\/*/, '').replace(/\/*$/, '');
     const folderPath = cleanFolder ? `ivr2:/${cleanFolder}` : `ivr2:/`;
@@ -55,10 +54,9 @@ async function getNextFileNumberStr(folder, reserveCount = 1) {
             const files = data.files || [];
             for (const f of files) {
                 const fname = (typeof f === 'string') ? f : (f && (f.name || f.fileName || ''));
-                const m = String(fname).match(/^(\d+)\.wav$/i);
+                const m = String(fname).match(/^(\d+)\.(wav|tts|txt|mp3)$/i);
                 if (m) {
                     const num = parseInt(m[1], 10);
-                    // מתעלמים מקובצי 900+ אם היו קובצי מערכת זמניים ישנים
                     if (!isNaN(num) && num < 900 && num > maxExisting) {
                         maxExisting = num;
                     }
@@ -111,13 +109,14 @@ async function getExtensionLatestAudioFile(extFolder) {
     return null;
 }
 
-// פונקציית העלאת קובץ WAV לנתיב מדויק בימות המשיח (למשל ivr2:/9/005.wav או ivr2:/8/012.wav)
-async function uploadWavBufferToExactPath(wavBuffer, exactTargetPath, fileNameLabel = 'audio.wav', timeoutMs = 35000) {
+// העלאת קובץ שמע לימות המשיח (תומך ב-MP3 עם convertAudio=1 לקבצים ארוכים וב-WAV)
+async function uploadAudioBufferToExactPath(audioBuffer, exactTargetPath, fileNameLabel = 'audio.mp3', convertAudio = '1', timeoutMs = 60000) {
+    const mimeType = fileNameLabel.endsWith('.mp3') ? 'audio/mpeg' : 'audio/wav';
     const formData = new FormData();
     formData.append('token', TOKEN);
     formData.append('path', exactTargetPath);
-    formData.append('convertAudio', '0');
-    formData.append('file', new Blob([wavBuffer], { type: 'audio/wav' }), fileNameLabel);
+    formData.append('convertAudio', convertAudio);
+    formData.append('file', new Blob([audioBuffer], { type: mimeType }), fileNameLabel);
 
     const upRes = await fetchWithTimeout(`${YM}UploadFile`, {
         method: 'POST',
@@ -125,11 +124,45 @@ async function uploadWavBufferToExactPath(wavBuffer, exactTargetPath, fileNameLa
     }, timeoutMs);
 
     const upText = await upRes.text();
-    console.log(`[Yemot Upload -> ${exactTargetPath}] Response:`, upText.slice(0, 220));
+    console.log(`[Yemot Audio Upload -> ${exactTargetPath}] Response:`, upText.slice(0, 220));
     return upText;
 }
 
-// 1. הורדת הקלטת הבקשה מימות המשיח (ללא מחיקה! + העתקה לשלוחה 8 כדי שכל ההקלטות יישמרו לתמיד בשלוחה 8!)
+// שמירת הטקסט שנוצר מזיהוי הדיבור ישירות לשלוחה 8 (גם כקובץ .tts להקראה בטלפון וגם כקובץ .txt)
+async function saveTranscriptionTextToExt8(transcribedText, callerPhone, recFilePath) {
+    try {
+        const nextNum = await getNextFileNumberStr(TEXT_ARCHIVE_EXT, 1);
+        const nowStr = new Date().toLocaleString('he-IL', { timeZone: 'Asia/Jerusalem' });
+        
+        // 1. קובץ TTS תקני לימות המשיח (כך שגם אם נכנסים לשלוחה 8 בטלפון שומעים את הטקסט שזוהה!)
+        const ttsContent = `${transcribedText}`;
+        const ttsTargetPath = `ivr2:/${TEXT_ARCHIVE_EXT}/${nextNum}.tts`;
+        const ttsForm = new FormData();
+        ttsForm.append('token', TOKEN);
+        ttsForm.append('path', ttsTargetPath);
+        ttsForm.append('convertAudio', '0');
+        ttsForm.append('file', new Blob([Buffer.from(ttsContent, 'utf8')], { type: 'text/plain; charset=utf-8' }), `${nextNum}.tts`);
+
+        await fetchWithTimeout(`${YM}UploadFile`, { method: 'POST', body: ttsForm }, 15000);
+        console.log(`[Text Archive Ext 8] Saved TTS text file to ${ttsTargetPath}: "${transcribedText}"`);
+
+        // 2. קובץ TXT מפורט עם פרטי החיפוש, השעה ומספר ההקלטה המקבילה בשלוחה 9
+        const txtDetails = `טקסט זיהוי דיבור: ${transcribedText}\r\nטלפון מחפש: ${callerPhone || 'לא ידוע'}\r\nזמן חיפוש: ${nowStr}\r\nקובץ הקלטה בשלוחה 9: ${recFilePath || ''}\r\n`;
+        const txtTargetPath = `ivr2:/${TEXT_ARCHIVE_EXT}/${nextNum}.txt`;
+        const txtForm = new FormData();
+        txtForm.append('token', TOKEN);
+        txtForm.append('path', txtTargetPath);
+        txtForm.append('convertAudio', '0');
+        txtForm.append('file', new Blob([Buffer.from(txtDetails, 'utf8')], { type: 'text/plain; charset=utf-8' }), `${nextNum}.txt`);
+
+        await fetchWithTimeout(`${YM}UploadFile`, { method: 'POST', body: txtForm }, 15000);
+        console.log(`[Text Archive Ext 8] Saved detailed TXT file to ${txtTargetPath}`);
+    } catch (err) {
+        console.warn('[Text Archive Ext 8] Error saving transcription text:', err.message);
+    }
+}
+
+// 1. הורדת הקלטת הבקשה משלוחה 9 (ההקלטה בקול של המשתמש נשארת שמורה בשלוחה 9 בלבד ואינה נמחקת!)
 async function downloadRecordingFromYemot(recordPath, apiDir) {
     const cleanPath = String(recordPath).replace(/^ivr2:\/*/, '').replace(/^\/*/, '');
     const cleanDir = String(apiDir || '').replace(/^ivr2:\/*/, '').replace(/^\/*/, '').replace(/\/*$/, '');
@@ -147,7 +180,7 @@ async function downloadRecordingFromYemot(recordPath, apiDir) {
     }
 
     const uniquePaths = [...new Set(candidates)];
-    console.log('[Yemot Download] Trying paths:', uniquePaths.join(' | '));
+    console.log('[Yemot Download] Trying paths in Ext 9:', uniquePaths.join(' | '));
 
     let lastYemotResponse = '';
     for (const p of uniquePaths) {
@@ -162,19 +195,7 @@ async function downloadRecordingFromYemot(recordPath, apiDir) {
             const headStr = buf.toString('utf8', 0, Math.min(buf.length, 150));
             
             if (buf.length > 200 && !headStr.includes('responseStatus') && !headStr.includes('EXCEPTION')) {
-                console.log(`[Yemot Download] Success from ${p} (${buf.length} bytes)`);
-                // איננו מוחקים שום הקלטה לעולם!
-                // בנוסף, אנו שומרים מיד עותק של הקלטת הבקשה בשלוחה 8 עם מספר סידורי חדש כדי שתישמר שם לתמיד:
-                (async () => {
-                    try {
-                        const nextArchNum = await getNextFileNumberStr(ARCHIVE_EXT, 1);
-                        const archRecPath = `ivr2:/${ARCHIVE_EXT}/${nextArchNum}.wav`;
-                        await uploadWavBufferToExactPath(buf, archRecPath, `${nextArchNum}.wav`, 20000);
-                        console.log(`[Archive Ext 8] Saved user request recording permanently to ${archRecPath}`);
-                    } catch (archErr) {
-                        console.warn('[Archive Ext 8] Failed saving user recording to ext 8:', archErr.message);
-                    }
-                })();
+                console.log(`[Yemot Download] Success from ${p} (${buf.length} bytes) - Kept permanently in extension!`);
                 return buf;
             } else {
                 lastYemotResponse = headStr;
@@ -274,16 +295,16 @@ async function transcribeAudio(audioBase64) {
     throw new Error('GEMINI_ERR: ' + lastErr);
 }
 
-// 3. המרת קובץ שמע מקומי ל-WAV תקני לימות המשיח (ללא קריסת FFmpeg)
-async function convertLocalFileToWav(inputPath, outputWavPath) {
+// 3. המרת קובץ שמע מקומי ל-MP3 דחוס ואיכותי (32kbps Mono) ללא הגבלת 16 דקות!
+async function convertLocalFileToMp3(inputPath, outputMp3Path) {
     await new Promise((resolve, reject) => {
-        const ffTimer = setTimeout(() => reject(new Error('Local FFmpeg timeout')), 25000);
+        const ffTimer = setTimeout(() => reject(new Error('Local FFmpeg timeout')), 90000);
         ffmpeg(inputPath)
-            .format('wav')
-            .audioCodec('pcm_s16le')
+            .format('mp3')
+            .audioCodec('libmp3lame')
             .audioChannels(1)
-            .audioFrequency(8000)
-            .duration(1800)
+            .audioFrequency(16000)
+            .audioBitrate('32k')
             .on('end', () => {
                 clearTimeout(ffTimer);
                 resolve();
@@ -292,12 +313,12 @@ async function convertLocalFileToWav(inputPath, outputWavPath) {
                 clearTimeout(ffTimer);
                 reject(err);
             })
-            .save(outputWavPath);
+            .save(outputMp3Path);
     });
 }
 
-// 4. שיטה א' (ראשית): הורדה ישירה דרך @distube/ytdl-core בתוך Node.js
-async function downloadViaYtdlAndConvert(videoId, outputWavPath, maxBytes = 15 * 1024 * 1024) {
+// 4. שיטה א' (ראשית): הורדה מלאה דרך @distube/ytdl-core (הוגדל ל-100MB עבור קבצים ארוכים במלואם!)
+async function downloadViaYtdlAndConvert(videoId, outputMp3Path, maxBytes = 100 * 1024 * 1024) {
     const tmpInput = path.join(os.tmpdir(), `ytdl_${Date.now()}_${Math.random().toString(36).slice(2)}.audio`);
     return new Promise((resolve, reject) => {
         let downloaded = 0;
@@ -314,20 +335,20 @@ async function downloadViaYtdlAndConvert(videoId, outputWavPath, maxBytes = 15 *
                 try { stream.destroy(); } catch (e) {}
                 fileStream.end(() => {
                     if (downloaded > 500000) {
-                        console.log(`[ytdl-core] Timeout reached but got ${downloaded} bytes, converting...`);
-                        convertLocalFileToWav(tmpInput, outputWavPath).then(() => { cleanup(); resolve(true); }).catch(err => { cleanup(); reject(err); });
+                        console.log(`[ytdl-core] Timeout reached after downloading ${downloaded} bytes, converting full downloaded part...`);
+                        convertLocalFileToMp3(tmpInput, outputMp3Path).then(() => { cleanup(); resolve(true); }).catch(err => { cleanup(); reject(err); });
                     } else {
                         cleanup();
                         reject(new Error(`ytdl-core timeout (${downloaded} bytes)`));
                     }
                 });
             }
-        }, 45000);
+        }, 120000);
 
         const stream = ytdl(`https://www.youtube.com/watch?v=${videoId}`, {
             filter: 'audioonly',
             quality: 'lowestaudio',
-            highWaterMark: 1 << 20
+            highWaterMark: 1 << 21
         });
 
         stream.on('data', (chunk) => {
@@ -340,8 +361,8 @@ async function downloadViaYtdlAndConvert(videoId, outputWavPath, maxBytes = 15 *
                 try { stream.destroy(); } catch (e) {}
                 fileStream.end(async () => {
                     try {
-                        console.log(`[ytdl-core] Downloaded ${downloaded} bytes to disk. Running local FFmpeg...`);
-                        await convertLocalFileToWav(tmpInput, outputWavPath);
+                        console.log(`[ytdl-core] Downloaded ${downloaded} bytes to disk. Converting to MP3...`);
+                        await convertLocalFileToMp3(tmpInput, outputMp3Path);
                         cleanup();
                         resolve(true);
                     } catch (e) {
@@ -359,8 +380,8 @@ async function downloadViaYtdlAndConvert(videoId, outputWavPath, maxBytes = 15 *
             fileStream.end(async () => {
                 try {
                     if (downloaded < 50000) throw new Error(`ytdl-core file too small (${downloaded} bytes)`);
-                    console.log(`[ytdl-core] Stream ended (${downloaded} bytes). Running local FFmpeg...`);
-                    await convertLocalFileToWav(tmpInput, outputWavPath);
+                    console.log(`[ytdl-core] Full stream ended (${downloaded} bytes). Converting to MP3...`);
+                    await convertLocalFileToMp3(tmpInput, outputMp3Path);
                     cleanup();
                     resolve(true);
                 } catch (e) {
@@ -382,7 +403,7 @@ async function downloadViaYtdlAndConvert(videoId, outputWavPath, maxBytes = 15 *
     });
 }
 
-// 5. שיטה ב' + ג' (גיבוי): חילוץ כתובות שמע מ-Piped API ו-Invidious
+// 5. שיטה ב' + ג' (גיבוי): חילוץ כתובות שמע מ-Piped API ו-Invidious (עדיפות ל-itag=139 ששוקל רק 28MB לשעה שלמה!)
 async function getFallbackAudioUrls(videoId) {
     const urls = [];
 
@@ -432,12 +453,7 @@ async function getFallbackAudioUrls(videoId) {
                 const data = await apiRes.json();
                 const formats = (data.adaptiveFormats || []).filter(f => (f.type || '').startsWith('audio/'));
                 if (formats.length > 0) {
-                    formats.sort((a, b) => {
-                        const aIs140 = String(a.itag) === '140' ? 0 : (String(a.itag) === '251' ? 1 : 2);
-                        const bIs140 = String(b.itag) === '140' ? 0 : (String(b.itag) === '251' ? 1 : 2);
-                        if (aIs140 !== bIs140) return aIs140 - bIs140;
-                        return (parseInt(a.bitrate) || 999999) - (parseInt(b.bitrate) || 999999);
-                    });
+                    formats.sort((a, b) => (parseInt(a.bitrate) || 999999) - (parseInt(b.bitrate) || 999999));
                     for (const fmt of formats.slice(0, 3)) {
                         const itag = fmt.itag || 140;
                         urls.push(`${host}/latest_version?id=${videoId}&itag=${itag}&local=true`);
@@ -450,18 +466,20 @@ async function getFallbackAudioUrls(videoId) {
     }
 
     for (const host of invidiousHosts.slice(0, 4)) {
+        urls.push(`${host}/latest_version?id=${videoId}&itag=139&local=true`);
+        urls.push(`${host}/latest_version?id=${videoId}&itag=249&local=true`);
         urls.push(`${host}/latest_version?id=${videoId}&itag=140&local=true`);
         urls.push(`${host}/latest_version?id=${videoId}&itag=251&local=true`);
-        urls.push(`${host}/latest_version?id=${videoId}&itag=139&local=true`);
     }
 
     return [...new Set(urls)];
 }
 
-async function downloadViaNodeAndConvertToWav(streamUrl, outputWavPath, maxBytes = 15 * 1024 * 1024) {
+// הורדת השמע המלא דרך Node.js (הוגדל מ-15MB ל-100MB וללא חיתוך!)
+async function downloadViaNodeAndConvertToMp3(streamUrl, outputMp3Path, maxBytes = 100 * 1024 * 1024) {
     const tmpInput = path.join(os.tmpdir(), `dl_${Date.now()}_${Math.random().toString(36).slice(2)}.audio`);
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 45000);
+    const timeoutId = setTimeout(() => controller.abort(), 110000);
 
     let downloaded = 0;
     try {
@@ -507,8 +525,8 @@ async function downloadViaNodeAndConvertToWav(streamUrl, outputWavPath, maxBytes
             throw new Error(`Downloaded file too partial/small (${downloaded} bytes)`);
         }
 
-        console.log(`[Node Download] Downloaded ${downloaded} bytes to local disk. Running local FFmpeg...`);
-        await convertLocalFileToWav(tmpInput, outputWavPath);
+        console.log(`[Node Download] Downloaded FULL ${downloaded} bytes to local disk. Converting to MP3...`);
+        await convertLocalFileToMp3(tmpInput, outputMp3Path);
         fs.promises.unlink(tmpInput).catch(() => null);
         return true;
 
@@ -519,21 +537,20 @@ async function downloadViaNodeAndConvertToWav(streamUrl, outputWavPath, maxBytes
     }
 }
 
-// 6. הורדה, המרה מקומית והעלאה לימות המשיח בשם ממוספר עולה מפורש (000.wav, 001.wav, 002.wav...)
-// גם לשלוחה הנוכחית וגם לשלוחה 8 – כך שאף קובץ לעולם לא נדרס!
+// 6. הורדה מלאה והעלאה לשלוחה 9 (ללא מגבלת 16 דקות!)
 async function downloadAndUploadToYemot(videoId, apiExtension, title, phone) {
-    const tmpWav = path.join(os.tmpdir(), `ym_${videoId}_${Date.now()}.wav`);
+    const tmpMp3 = path.join(os.tmpdir(), `ym_${videoId}_${Date.now()}.mp3`);
     const extFolder = String(apiExtension || '9').replace(/^ivr2:\/*/, '').replace(/^\/*/, '').replace(/\/*$/, '');
 
     try {
         let converted = false;
 
-        // ניסיון 1: הורדה ישירה ומהירה דרך @distube/ytdl-core
+        // ניסיון 1: הורדה מלאה דרך @distube/ytdl-core
         try {
-            console.log(`[Step 5 Audio] Trying primary engine (@distube/ytdl-core) for ${videoId}...`);
-            await downloadViaYtdlAndConvert(videoId, tmpWav);
-            if (fs.existsSync(tmpWav) && fs.statSync(tmpWav).size > 50000) {
-                console.log(`[Step 5 Audio] Primary engine succeeded (${fs.statSync(tmpWav).size} bytes)!`);
+            console.log(`[Step 5 Audio] Trying primary engine (@distube/ytdl-core) for full audio ${videoId}...`);
+            await downloadViaYtdlAndConvert(videoId, tmpMp3);
+            if (fs.existsSync(tmpMp3) && fs.statSync(tmpMp3).size > 20000) {
+                console.log(`[Step 5 Audio] Primary engine succeeded (${fs.statSync(tmpMp3).size} bytes)!`);
                 converted = true;
             }
         } catch (ytdlErr) {
@@ -546,10 +563,10 @@ async function downloadAndUploadToYemot(videoId, apiExtension, title, phone) {
             for (const pUrl of proxyUrls.slice(0, 8)) {
                 if (converted) break;
                 try {
-                    console.log(`[Step 5 Audio] Downloading via Node from: ${pUrl.slice(0, 85)}...`);
-                    await downloadViaNodeAndConvertToWav(pUrl, tmpWav);
-                    if (fs.existsSync(tmpWav) && fs.statSync(tmpWav).size > 50000) {
-                        console.log(`[Step 5 Audio] Local WAV created successfully (${fs.statSync(tmpWav).size} bytes)!`);
+                    console.log(`[Step 5 Audio] Downloading full audio via Node from: ${pUrl.slice(0, 85)}...`);
+                    await downloadViaNodeAndConvertToMp3(pUrl, tmpMp3);
+                    if (fs.existsSync(tmpMp3) && fs.statSync(tmpMp3).size > 20000) {
+                        console.log(`[Step 5 Audio] Local MP3 created successfully (${fs.statSync(tmpMp3).size} bytes)!`);
                         converted = true;
                     }
                 } catch (pErr) {
@@ -562,45 +579,30 @@ async function downloadAndUploadToYemot(videoId, apiExtension, title, phone) {
             throw new Error('All download engines failed');
         }
 
-        const wavBuffer = await fs.promises.readFile(tmpWav);
+        const mp3Buffer = await fs.promises.readFile(tmpMp3);
 
-        // קבלת המספר הפנוי הבא בשלוחה הנוכחית (למשל 000, 001, 002...)
+        // קבלת המספר הפנוי הבא בשלוחה 9
         const nextExtNum = await getNextFileNumberStr(extFolder, 1);
         const yemotTargetPath = extFolder ? `ivr2:/${extFolder}/${nextExtNum}.wav` : `ivr2:/${nextExtNum}.wav`;
         const playFileCommand = extFolder ? `f-/${extFolder}/${nextExtNum}` : `f-/${nextExtNum}`;
 
-        console.log(`[Step 5 Upload] Uploading ${wavBuffer.length} bytes to ${yemotTargetPath} (never overwrites!)...`);
-        await uploadWavBufferToExactPath(wavBuffer, yemotTargetPath, `${nextExtNum}.wav`, 35000);
+        console.log(`[Step 5 Upload] Uploading full audio (${mp3Buffer.length} bytes MP3 -> convertAudio=1) to ${yemotTargetPath}...`);
+        await uploadAudioBufferToExactPath(mp3Buffer, yemotTargetPath, `${nextExtNum}.mp3`, '1', 90000);
 
-        // העלאה מקבילה גם לשלוחה 8 (ארכיון קבוע של כל ההשמעות וההקלטות)
-        if (extFolder !== ARCHIVE_EXT) {
-            (async () => {
-                try {
-                    const nextArchNum = await getNextFileNumberStr(ARCHIVE_EXT, 1);
-                    const archAudioPath = `ivr2:/${ARCHIVE_EXT}/${nextArchNum}.wav`;
-                    await uploadWavBufferToExactPath(wavBuffer, archAudioPath, `${nextArchNum}.wav`, 35000);
-                    console.log(`[Archive Ext 8] Saved downloaded audio permanently to ${archAudioPath}`);
-                } catch (archErr) {
-                    console.warn('[Archive Ext 8] Failed saving audio to ext 8:', archErr.message);
-                }
-            })();
-        }
-
-        // שמירת ההורדה בזיכרון עבור המתקשר הנוכחי ועבור הקו כולו
         const savedInfo = { playCmd: playFileCommand, title: title || 'ההורדה הקודמת', time: Date.now() };
         if (phone) lastDownloadByPhone.set(phone, savedInfo);
         globalLastDownload = savedInfo;
 
-        fs.promises.unlink(tmpWav).catch(() => null);
+        fs.promises.unlink(tmpMp3).catch(() => null);
         return playFileCommand;
 
     } catch (e) {
-        fs.promises.unlink(tmpWav).catch(() => null);
+        fs.promises.unlink(tmpMp3).catch(() => null);
         throw e;
     }
 }
 
-app.get('/', (req, res) => { res.send('YouTube Line Server v10.5 OK - Permanent Numbered Files + Ext 8 Archive'); });
+app.get('/', (req, res) => { res.send('YouTube Line Server v11.1 OK - Full Length Audio + Ext 8 Text Archive + Ext 9 Voice Search'); });
 
 app.all(['/yemot', '/yemot/:e'], async (req, res) => {
     const q = { ...req.query, ...req.body };
@@ -614,12 +616,12 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
         const extFolder = String(q.ApiExtension || '9').replace(/^ivr2:\/*/, '').replace(/^\/*/, '').replace(/\/*$/, '');
         const callerPhone = String(q.ApiPhone || '').trim();
 
-        // שלב 0: תפריט פתיחה
+        // שלב 0: תפריט פתיחה בשלוחה 9
         if (!q.MenuChoice && !q.RecordPath) {
             return res.send('read=t-לחיפוש חדש הקישו 1 להאזנה להורדה הקודמת הקישו 2=MenuChoice,no,1,1,7,Digits,no');
         }
 
-        // אם המשתמש הקיש 2 -> השמעת ההורדה הקודמת מיד
+        // אם המשתמש הקיש 2 -> השמעת ההורדה הקודמת
         if (q.MenuChoice === '2' && !q.RecordPath) {
             let prev = (callerPhone && lastDownloadByPhone.get(callerPhone)) || globalLastDownload;
             if (!prev) {
@@ -632,22 +634,20 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
                 console.log(`[Replay Previous] Playing ${prev.playCmd} (${prev.title}) for ${callerPhone}`);
                 return res.send(`id_list_message=t-משמיע את ${prev.title}.${prev.playCmd}&go_to_folder=/`);
             } else {
-                // אם אין עדיין הורדה קודמת, מבקשים הקלטה חדשה עם מספר קובץ ייחודי שלא דורס כלום
                 const recNum = await getNextFileNumberStr(extFolder, 1);
                 const recFolder = extFolder ? `/${extFolder}` : '';
-                return res.send(`id_list_message=t-עדיין לא קיימת הורדה קודמת בקו&read=t-אנא אמרו את שם השיעור או השיר המבוקש ובסיום הקישו סולמית=RecordPath,no,record,${recFolder},${recNum},no,7,1`);
+                return res.send(`id_list_message=t-עדיין לא קיימת הורדה קודמת בקו&read=t-אנא אמרו את שם הערך המבוקש ובסיום הקישו סולמית=RecordPath,no,record,${recFolder},${recNum},no,7,1`);
             }
         }
 
-        // שלב 1: המשתמש בחר 1 -> מבקשים הקלטה של החיפוש החדש
-        // כל הקלטת בקשה מקבלת מספר קובץ עולה חדש משלה (למשל 000, 001, 002...) וכך גם ההקלטות נשמרות בשלוחה ולא נדרסות!
+        // שלב 1: הקלטת החיפוש בקולו של המשתמש ונשמרת בשלוחה 9 במספר עולה (000.wav, 001.wav...)
         if (!q.RecordPath) {
             const recNum = await getNextFileNumberStr(extFolder, 1);
             const recFolder = extFolder ? `/${extFolder}` : '';
-            return res.send(`read=t-אנא אמרו את שם השיעור או השיר המבוקש ובסיום הקישו סולמית=RecordPath,no,record,${recFolder},${recNum},no,7,1`);
+            return res.send(`read=t-אנא אמרו את שם הערך המבוקש ובסיום הקישו סולמית=RecordPath,no,record,${recFolder},${recNum},no,7,1`);
         }
 
-        // שלב 2: הורדת ההקלטה מימות המשיח (ללא מחיקה + העתקה לשלוחה 8)
+        // שלב 2: הורדת ההקלטה משלוחה 9 (ההקלטה הקולית נשארת שמורה בשלוחה 9!)
         let audioBuf;
         try {
             audioBuf = await downloadRecordingFromYemot(q.RecordPath, q.ApiExtension);
@@ -656,7 +656,7 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
             return res.send('id_list_message=t-שגיאה בהורדת ההקלטה מימות המשיח&go_to_folder=/');
         }
 
-        // שלב 3: תמלול מהיר ב-Gemini (ללא סינון)
+        // שלב 3: זיהוי דיבור ב-Gemini (ללא סינון)
         let rawText = '';
         try {
             rawText = await transcribeAudio(audioBuf.toString('base64'));
@@ -671,6 +671,9 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
         if (!cleanQuery) {
             return res.send('id_list_message=t-לא הצלחתי לשמוע את הבקשה אנא נסו שנית&go_to_folder=/');
         }
+
+        // שמירת קובץ הטקסט של זיהוי הדיבור (.tts + .txt) ישירות לשלוחה 8!
+        saveTranscriptionTextToExt8(cleanQuery, callerPhone, q.RecordPath);
 
         // שלב 4: חיפוש ביוטיוב
         const ytUrl = `https://www.googleapis.com/youtube/v3/search?part=snippet&q=${encodeURIComponent(cleanQuery)}&type=video&maxResults=1&key=${YT_KEY}`;
@@ -690,7 +693,7 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
         const title = (ytData.items[0].snippet.title || '').replace(/[^א-תa-zA-Z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
         console.log(`[Step 4 Match] Video ${videoId}: ${title}`);
 
-        // שלב 5: הורדה מלאה, המרה מקומית ל-WAV והעלאה לימות המשיח במספר סידורי חדש (גם לשלוחה הנוכחית וגם לשלוחה 8!)
+        // שלב 5: הורדת הקובץ המלא והעלאתו לשלוחה 9
         try {
             const playCmd = await downloadAndUploadToYemot(videoId, q.ApiExtension, title, callerPhone);
             console.log(`[Step 5 Ready] Sending play command: ${playCmd}`);
@@ -701,7 +704,7 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
         }
 
     } catch (e) {
-        console.error('[General Error v10.5]', e.message);
+        console.error('[General Error v11.1]', e.message);
         if (!res.headersSent) {
             return res.send('id_list_message=t-אירעה תקלה כללית בשרת&go_to_folder=/');
         }
@@ -709,4 +712,4 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
 });
 
 const port = process.env.PORT || 3000;
-app.listen(port, () => console.log(`=== Server v10.5 Ready on port ${port} ===`));
+app.listen(port, () => console.log(`=== Server v11.1 Ready on port ${port} ===`));
