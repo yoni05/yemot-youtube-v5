@@ -32,22 +32,20 @@ async function fetchWithTimeout(url, options = {}, timeout = 25000) {
     }
 }
 
-// 1. הורדת הקלטה מימות המשיח מכל הנתיבים האפשריים
+// 1. הורדת הקלטה מימות המשיח (מהירה וממוקדת)
 async function downloadRecordingFromYemot(recordPath, apiDir) {
     const cleanPath = String(recordPath).replace(/^ivr2:\/*/, '').replace(/^\/*/, '');
     const cleanDir = String(apiDir || '').replace(/^ivr2:\/*/, '').replace(/^\/*/, '').replace(/\/*$/, '');
     
     const candidates = [
         `ivr2:/${cleanPath}`,
-        `ivr2:${cleanPath}`,
-        cleanPath
+        `ivr2:${cleanPath}`
     ];
-    if (cleanDir) {
+    if (cleanDir && !cleanPath.startsWith(cleanDir + '/')) {
         candidates.unshift(`ivr2:/${cleanDir}/${cleanPath}`);
-        candidates.push(`ivr2:${cleanDir}/${cleanPath}`);
     }
     if (!cleanPath.toLowerCase().endsWith('.wav')) {
-        candidates.push(`ivr2:/${cleanPath}.wav`);
+        candidates.unshift(`ivr2:/${cleanPath}.wav`);
         if (cleanDir) candidates.unshift(`ivr2:/${cleanDir}/${cleanPath}.wav`);
     }
 
@@ -58,7 +56,7 @@ async function downloadRecordingFromYemot(recordPath, apiDir) {
     for (const p of uniquePaths) {
         const url = `${YM}DownloadFile?token=${encodeURIComponent(TOKEN)}&path=${encodeURIComponent(p)}`;
         try {
-            const res = await fetchWithTimeout(url, {}, 15000);
+            const res = await fetchWithTimeout(url, {}, 12000);
             if (!res.ok) {
                 lastYemotResponse = `HTTP_${res.status}`;
                 continue;
@@ -72,7 +70,6 @@ async function downloadRecordingFromYemot(recordPath, apiDir) {
                 return buf;
             } else {
                 lastYemotResponse = headStr;
-                console.warn(`[Yemot Download] Invalid content at ${p}:`, headStr);
             }
         } catch (e) {
             lastYemotResponse = e.message;
@@ -81,136 +78,97 @@ async function downloadRecordingFromYemot(recordPath, apiDir) {
     throw new Error('YEMOT_DOWNLOAD_ERR: ' + lastYemotResponse);
 }
 
-// 2. זיהוי אוטומטי של המודל הפעיל ב-Gemini (כולל gemini-3.0-flash)
-async function getAvailableGeminiModel() {
-    if (cachedModelName) return cachedModelName;
+// 2. בחירת המודל המהיר והזמין בחשבון (תומך ב-gemini-3.5-flash ו-gemini-flash-lite-latest ללא עיכוב חשיבה)
+async function getFastGeminiModels() {
+    const defaultFastOrder = [
+        'gemini-flash-lite-latest',
+        'gemini-3.5-flash-lite',
+        'gemini-3.5-flash',
+        'gemini-3.5-transcribe',
+        'gemini-flash-latest',
+        'gemini-3.6-flash'
+    ];
+    if (cachedModelName) {
+        return [cachedModelName, ...defaultFastOrder.filter(m => m !== cachedModelName)];
+    }
     try {
-        const res = await fetchWithTimeout(`https://generativelanguage.googleapis.com/v1beta/models?key=${GEMINI_KEY}`, {}, 10000);
+        const res = await fetchWithTimeout(`https://generativelanguage.googleapis.com/v1beta/models?key=${GEMINI_KEY}`, {}, 8000);
         if (res.ok) {
             const data = await res.json();
-            const models = (data.models || [])
+            const available = (data.models || [])
                 .filter(m => (m.supportedGenerationMethods || []).includes('generateContent'))
-                .map(m => m.name.replace('models/', ''));
-            
-            console.log('[Gemini] Available models for key:', models.join(', '));
+                .map(m => m.name.replace('models/', ''))
+                .filter(m => !m.includes('2.5') && !m.includes('1.5') && !m.includes('tts') && !m.includes('image') && !m.includes('robotics') && !m.includes('research') && !m.includes('computer-use'));
 
-            const preferred = [
-                'gemini-3.0-flash',
-                'gemini-3.0-flash-001',
-                'gemini-3-flash',
-                'gemini-flash-latest',
-                'gemini-2.0-flash'
-            ];
-            for (const p of preferred) {
-                if (models.includes(p)) {
-                    cachedModelName = p;
-                    return p;
+            console.log('[Gemini] Filtered fast models for key:', available.join(', '));
+
+            const matched = [];
+            for (const pref of defaultFastOrder) {
+                if (available.includes(pref)) matched.push(pref);
+            }
+            for (const m of available) {
+                if ((m.includes('flash') || m.includes('transcribe')) && !matched.includes(m)) {
+                    matched.push(m);
                 }
             }
-            const anyFlash = models.find(m => m.includes('flash') && !m.includes('tts') && !m.includes('image') && !m.includes('vision'));
-            if (anyFlash) {
-                cachedModelName = anyFlash;
-                return anyFlash;
+            if (matched.length > 0) {
+                cachedModelName = matched[0];
+                return matched;
             }
-            if (models.length > 0) {
-                cachedModelName = models[0];
-                return models[0];
-            }
-        } else {
-            console.error('[Gemini] ListModels failed:', await res.text());
         }
     } catch (e) {
         console.error('[Gemini] Error listing models:', e.message);
     }
-    return 'gemini-3.0-flash';
+    return defaultFastOrder;
 }
 
 async function transcribeAudio(audioBase64) {
-    const primary = await getAvailableGeminiModel();
-    const modelsToTry = [...new Set([primary, 'gemini-3.0-flash', 'gemini-flash-latest', 'gemini-2.0-flash'])];
+    const modelsToTry = await getFastGeminiModels();
     const prompt = "תמלל את ההקלטה לעברית. החזר אך ורק את המילים שנאמרו בהקלטה ללא שום תוספת, ללא סימני פיסוק וללא הסברים.";
 
     let lastErr = '';
-    for (const model of modelsToTry) {
+    for (const model of modelsToTry.slice(0, 4)) {
+        console.log(`[Gemini] Attempting transcription with model: ${model}`);
         const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_KEY}`;
-        const res = await fetchWithTimeout(url, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                contents: [{
-                    parts: [
-                        { text: prompt },
-                        { inlineData: { mimeType: 'audio/wav', data: audioBase64 } }
-                    ]
-                }]
-            })
-        }, 20000);
+        try {
+            const res = await fetchWithTimeout(url, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    contents: [{
+                        parts: [
+                            { text: prompt },
+                            { inlineData: { mimeType: 'audio/wav', data: audioBase64 } }
+                        ]
+                    }],
+                    generationConfig: {
+                        temperature: 0.1,
+                        maxOutputTokens: 60
+                    }
+                })
+            }, 14000);
 
-        if (res.ok) {
-            cachedModelName = model;
-            const data = await res.json();
-            const text = data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
-            console.log(`[Gemini] Model ${model} transcription:`, JSON.stringify(text));
-            return text;
+            if (res.ok) {
+                cachedModelName = model;
+                const data = await res.json();
+                const text = data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+                console.log(`[Gemini] Model ${model} success:`, JSON.stringify(text));
+                return text;
+            }
+
+            lastErr = await res.text();
+            console.warn(`[Gemini] Model ${model} failed (${res.status}):`, lastErr.slice(0, 250));
+            if (cachedModelName === model) cachedModelName = null;
+        } catch (err) {
+            lastErr = err.message;
+            console.warn(`[Gemini] Model ${model} timeout/error:`, err.message);
+            if (cachedModelName === model) cachedModelName = null;
         }
-
-        lastErr = await res.text();
-        console.warn(`[Gemini] Model ${model} error (${res.status}):`, lastErr);
-        if (res.status === 404) cachedModelName = null;
     }
     throw new Error('GEMINI_ERR: ' + lastErr);
 }
 
-// 3. הורדה, המרה והעלאה מהירה לימות המשיח
-async function downloadConvertAndUploadToYemot(videoId, targetYemotPath) {
-    const tmpWav = path.join(os.tmpdir(), `yt_${videoId}_${Date.now()}.wav`);
-    try {
-        console.log(`[Audio] Converting video ${videoId}...`);
-        await new Promise((resolve, reject) => {
-            const subprocess = ytDlp.exec(`https://www.youtube.com/watch?v=${videoId}`, {
-                output: '-',
-                format: 'bestaudio[ext=m4a]/bestaudio/best',
-                noWarnings: true,
-                noCheckCertificates: true,
-                extractorArgs: 'youtube:player_client=android,web'
-            }, { stdio: ['ignore', 'pipe', 'ignore'] });
-
-            ffmpeg(subprocess.stdout)
-                .format('wav')
-                .audioCodec('pcm_s16le')
-                .audioChannels(1)
-                .audioFrequency(8000)
-                .duration(900) // 15 דקות ראשונות להמרה והעלאה מהירה ללא Timeout
-                .on('end', resolve)
-                .on('error', reject)
-                .save(tmpWav);
-        });
-
-        const wavBuffer = await fs.promises.readFile(tmpWav);
-        console.log(`[Audio] WAV size: ${wavBuffer.length} bytes. Uploading to ${targetYemotPath}...`);
-
-        const formData = new FormData();
-        formData.append('token', TOKEN);
-        formData.append('path', targetYemotPath);
-        formData.append('convertAudio', '0');
-        formData.append('file', new Blob([wavBuffer], { type: 'audio/wav' }), '000.wav');
-
-        const upRes = await fetchWithTimeout(`${YM}UploadFile`, {
-            method: 'POST',
-            body: formData
-        }, 30000);
-
-        const upText = await upRes.text();
-        console.log('[Yemot Upload] Response:', upText);
-        fs.promises.unlink(tmpWav).catch(() => null);
-        return true;
-    } catch (e) {
-        fs.promises.unlink(tmpWav).catch(() => null);
-        throw e;
-    }
-}
-
-app.get('/', (req, res) => { res.send('YouTube Line Server v5.0 OK - Active'); });
+app.get('/', (req, res) => { res.send('YouTube Line Server v6.0 OK - Fast Audio Transcription'); });
 
 // נתיב הזרמה ישיר בפורמט MP3 ו-WAV
 app.get('/stream/:videoId.:ext', (req, res) => {
@@ -257,9 +215,10 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
     try {
         if (q.hangup === 'yes') return res.send('noop');
 
-        // שלב 1: בקשת הקלטה פשוטה ותקנית
+        // שלב 1: בקשת הקלטה עם תחביר תקני ומדויק של ימות המשיח (ללא דריסת שם הקובץ ל-no.wav!)
+        // פרמטרים: RecordPath, use_existing(no), record, folder, filename, no_confirm(no), max_sec(7), min_sec(1)
         if (!q.RecordPath) {
-            return res.send('read=t-אנא אמרו את שם השיעור המבוקש ובסיום הקישו סולמית=RecordPath,no,record,,no,7,2');
+            return res.send('read=t-אנא אמרו את שם השיעור המבוקש ובסיום הקישו סולמית=RecordPath,no,record,,,no,7,1');
         }
 
         // שלב 2: הורדת ההקלטה מימות המשיח
@@ -268,10 +227,10 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
             audioBuf = await downloadRecordingFromYemot(q.RecordPath, q.ApiExtension);
         } catch (dlErr) {
             console.error('[Step 2 Error]', dlErr.message);
-            return res.send('id_list_message=t-שגיאה בהורדת ההקלטה מימות המשיח בדקו את הטוקן&go_to_folder=/');
+            return res.send('id_list_message=t-שגיאה בהורדת ההקלטה מימות המשיח&go_to_folder=/');
         }
 
-        // שלב 3: תמלול ב-Gemini
+        // שלב 3: תמלול מהיר ב-Gemini
         let rawText = '';
         try {
             rawText = await transcribeAudio(audioBuf.toString('base64'));
@@ -284,17 +243,17 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
         console.log('[Step 3 Clean Query]', cleanQuery);
 
         if (!cleanQuery) {
-            return res.send('id_list_message=t-ההקלטה הייתה שקטה מדי אנא נסו שנית&go_to_folder=/');
+            return res.send('id_list_message=t-לא הצלחתי לשמוע את הבקשה אנא נסו שנית&go_to_folder=/');
         }
 
         // שלב 4: חיפוש ב-YouTube API
         const ytUrl = `https://www.googleapis.com/youtube/v3/search?part=snippet&q=${encodeURIComponent(cleanQuery)}&type=video&maxResults=1&key=${YT_KEY}`;
-        const ytRes = await fetchWithTimeout(ytUrl);
+        const ytRes = await fetchWithTimeout(ytUrl, {}, 12000);
         const ytData = await ytRes.json();
 
         if (!ytRes.ok) {
             console.error('[Step 4 Error]', JSON.stringify(ytData));
-            return res.send('id_list_message=t-שגיאה במפתח החיפוש של יוטיוב&go_to_folder=/');
+            return res.send('id_list_message=t-שגיאה במפתח החיפוש&go_to_folder=/');
         }
 
         if (!ytData.items || ytData.items.length === 0) {
@@ -303,6 +262,7 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
 
         const videoId = ytData.items[0].id.videoId;
         const title = (ytData.items[0].snippet.title || '').replace(/[^א-תa-zA-Z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
+        console.log(`[Step 4 Match] Video ${videoId}: ${title}`);
 
         // שלב 5: השמעת התוצאה
         const hostUrl = `https://${req.get('host')}`;
@@ -311,7 +271,7 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
         return res.send(`id_list_message=t-משמיע ${title}.f-${streamUrl}&go_to_folder=/`);
 
     } catch (e) {
-        console.error('[General Error v5.0]', e.message);
+        console.error('[General Error v6.0]', e.message);
         if (!res.headersSent) {
             return res.send('id_list_message=t-אירעה תקלה כללית בשרת&go_to_folder=/');
         }
@@ -319,4 +279,4 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
 });
 
 const port = process.env.PORT || 3000;
-app.listen(port, () => console.log(`=== Server v5.0 Ready on port ${port} ===`));
+app.listen(port, () => console.log(`=== Server v6.0 Ready on port ${port} ===`));
