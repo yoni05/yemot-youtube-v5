@@ -1,11 +1,10 @@
 const express = require('express');
-const ytDlp = require('yt-dlp-exec');
-const ytdl = require('@distube/ytdl-core');
 const ffmpeg = require('fluent-ffmpeg');
 const ffmpegPath = require('ffmpeg-static');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const { Readable } = require('stream');
 
 ffmpeg.setFfmpegPath(ffmpegPath);
 
@@ -57,7 +56,7 @@ async function downloadRecordingFromYemot(recordPath, apiDir) {
     for (const p of uniquePaths) {
         const url = `${YM}DownloadFile?token=${encodeURIComponent(TOKEN)}&path=${encodeURIComponent(p)}`;
         try {
-            const res = await fetchWithTimeout(url, {}, 12000);
+            const res = await fetchWithTimeout(url, {}, 10000);
             if (!res.ok) {
                 lastYemotResponse = `HTTP_${res.status}`;
                 continue;
@@ -93,7 +92,7 @@ async function getFastGeminiModels() {
         return [cachedModelName, ...defaultFastOrder.filter(m => m !== cachedModelName)];
     }
     try {
-        const res = await fetchWithTimeout(`https://generativelanguage.googleapis.com/v1beta/models?key=${GEMINI_KEY}`, {}, 8000);
+        const res = await fetchWithTimeout(`https://generativelanguage.googleapis.com/v1beta/models?key=${GEMINI_KEY}`, {}, 7000);
         if (res.ok) {
             const data = await res.json();
             const available = (data.models || [])
@@ -123,7 +122,7 @@ async function getFastGeminiModels() {
 
 async function transcribeAudio(audioBase64) {
     const modelsToTry = await getFastGeminiModels();
-    const prompt = "תמלל את ההקלטה לעברית. החזר אך ורק את המילים שנאמרו בהקלטה ללא שום תוספת, ללא סימני פיסוק וללא הסברים.";
+    const prompt = "תמלל את ההקלטה לעברית. החזר אך ורק את המילים שנאמרו בהקלטה ללא שום תוספת, ללא סימני פיסוק וללא הסברים. אם מדובר בתוכן לא ראוי שאינו מתאים לאורח חיים תורני-חרדי (כגון תרבות חילונית, סרטים, ספורט, רכילות או שירים פסולים), החזר את המילה BLOCKED בלבד.";
 
     let lastErr = '';
     for (const model of modelsToTry.slice(0, 4)) {
@@ -145,7 +144,7 @@ async function transcribeAudio(audioBase64) {
                         maxOutputTokens: 60
                     }
                 })
-            }, 14000);
+            }, 12000);
 
             if (res.ok) {
                 cachedModelName = model;
@@ -156,7 +155,7 @@ async function transcribeAudio(audioBase64) {
             }
 
             lastErr = await res.text();
-            console.warn(`[Gemini] Model ${model} failed (${res.status}):`, lastErr.slice(0, 250));
+            console.warn(`[Gemini] Model ${model} failed (${res.status}):`, lastErr.slice(0, 200));
             if (cachedModelName === model) cachedModelName = null;
         } catch (err) {
             lastErr = err.message;
@@ -167,87 +166,57 @@ async function transcribeAudio(audioBase64) {
     throw new Error('GEMINI_ERR: ' + lastErr);
 }
 
-// 3. מנוע שליפת שמע עוקף חסימות IP של Render (דינמי: Invidious + Piped + Cobalt)
+// 3. איתור מהיר של כתובות שמע משרתי פרוקסי (ללא קריסת FFmpeg)
 async function getProxyAudioUrls(videoId) {
     const urls = [];
 
-    // א. שליפה דינמית של שרתי Invidious פעילים ותקינים בזמן אמת
     const invidiousHosts = [
+        'https://yt.chocolatemoo53.com',
         'https://inv.nadeko.net',
         'https://invidious.nerdvpn.de',
         'https://inv.tux.pizza',
         'https://invidious.jing.rocks',
         'https://invidious.privacyredirect.com',
-        'https://iv.ggtyler.dev',
-        'https://invidious.lunar.icu'
+        'https://iv.ggtyler.dev'
     ];
 
     try {
-        const listRes = await fetchWithTimeout('https://api.invidious.io/instances.json?sort_by=health', {}, 4000);
+        const listRes = await fetchWithTimeout('https://api.invidious.io/instances.json?sort_by=health', {}, 3500);
         if (listRes.ok) {
             const listData = await listRes.json();
             for (const item of listData) {
                 if (Array.isArray(item) && item[1] && item[1].type === 'https' && item[1].api === true) {
                     const uri = item[1].uri.replace(/\/+$/, '');
-                    if (!invidiousHosts.includes(uri)) invidiousHosts.unshift(uri);
+                    if (!invidiousHosts.includes(uri)) invidiousHosts.splice(1, 0, uri);
                 }
             }
         }
     } catch (e) {}
 
-    for (const host of invidiousHosts.slice(0, 8)) {
+    for (const host of invidiousHosts.slice(0, 7)) {
         try {
             const apiRes = await fetchWithTimeout(`${host}/api/v1/videos/${videoId}`, {
-                headers: { 'User-Agent': 'Mozilla/5.0' }
-            }, 4500);
+                headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' }
+            }, 4000);
             if (apiRes.ok) {
                 const data = await apiRes.json();
                 const formats = (data.adaptiveFormats || []).filter(f => (f.type || '').startsWith('audio/'));
                 if (formats.length > 0) {
                     formats.sort((a, b) => (parseInt(a.bitrate) || 999999) - (parseInt(b.bitrate) || 999999));
-                    const itag = formats[0].itag || 140;
-                    // שימוש ב-local=true מכריח את שרת ה-Invidious להזרים את השמע דרכו וכך עוקף את חסימת ה-IP של Render!
-                    urls.push(`${host}/latest_version?id=${videoId}&itag=${itag}&local=true`);
-                    if (formats[0].url) urls.push(formats[0].url);
-                    console.log(`[Proxy Audio] Found Invidious stream via ${host} (itag ${itag})`);
-                    break;
-                }
-            }
-        } catch (e) {}
-    }
-
-    // ב. שרתי Piped פעילים
-    const pipedHosts = [
-        'https://pipedapi.kavin.rocks',
-        'https://pipedapi.leptons.xyz',
-        'https://pipedapi.nosebs.ru',
-        'https://api.piped.private.coffee',
-        'https://pipedapi.drgns.space'
-    ];
-
-    for (const api of pipedHosts) {
-        if (urls.length >= 2) break;
-        try {
-            const res = await fetchWithTimeout(`${api}/streams/${videoId}`, {
-                headers: { 'User-Agent': 'Mozilla/5.0' }
-            }, 4500);
-            if (res.ok) {
-                const data = await res.json();
-                const streams = data.audioStreams || [];
-                if (streams.length > 0) {
-                    streams.sort((a, b) => (a.bitrate || 999999) - (b.bitrate || 999999));
-                    if (streams[0].url) {
-                        console.log(`[Proxy Audio] Found Piped stream via ${api}`);
-                        urls.push(streams[0].url);
-                        break;
+                    for (const fmt of formats.slice(0, 2)) {
+                        const itag = fmt.itag || 140;
+                        urls.push(`${host}/latest_version?id=${videoId}&itag=${itag}&local=true`);
                     }
+                    console.log(`[Proxy Audio] Found Invidious stream via ${host} (itag ${formats[0].itag})`);
+                    if (urls.length >= 2) break;
                 }
             }
         } catch (e) {}
     }
 
-    // ג. גיבוי ישיר דרך פרוקסי Invidious מהיר גם ללא API
+    // הוספת כתובות פרוקסי ישירות לגיבוי
     for (const host of invidiousHosts.slice(0, 4)) {
+        urls.push(`${host}/latest_version?id=${videoId}&itag=139&local=true`);
         urls.push(`${host}/latest_version?id=${videoId}&itag=140&local=true`);
         urls.push(`${host}/latest_version?id=${videoId}&itag=251&local=true`);
     }
@@ -255,33 +224,83 @@ async function getProxyAudioUrls(videoId) {
     return [...new Set(urls)];
 }
 
-// 4. המרת זרם שמע או קישור לקובץ WAV תקני של ימות המשיח (8000Hz, Mono, 16-bit PCM)
-async function convertSourceToWav(inputSource, outputWavPath, maxDurationSec = 480) {
-    return new Promise((resolve, reject) => {
-        const timer = setTimeout(() => {
-            reject(new Error('FFmpeg conversion timed out'));
-        }, 18000);
+// 4. הורדת השמע באמצעות Node.js (כדי ש-FFmpeg לא ייגש ל-HTTPS ולא יקרוס עם SIGSEGV!)
+// מוריד עד 6MB ראשונים של השמע (כ-10-15 דקות של שיעור) תוך שניות בודדות וממיר מקומית ל-WAV
+async function downloadViaNodeAndConvertToWav(streamUrl, outputWavPath, maxBytes = 6 * 1024 * 1024) {
+    const tmpInput = path.join(os.tmpdir(), `dl_${Date.now()}_${Math.random().toString(36).slice(2)}.audio`);
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 14000);
 
-        ffmpeg(inputSource)
-            .inputOptions(['-reconnect 1', '-reconnect_streamed 1', '-reconnect_delay_max 4'])
-            .format('wav')
-            .audioCodec('pcm_s16le')
-            .audioChannels(1)
-            .audioFrequency(8000)
-            .duration(maxDurationSec)
-            .on('end', () => {
-                clearTimeout(timer);
-                resolve();
-            })
-            .on('error', (err) => {
-                clearTimeout(timer);
-                reject(err);
-            })
-            .save(outputWavPath);
-    });
+    try {
+        const res = await fetch(streamUrl, {
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+                'Range': `bytes=0-${maxBytes}`
+            },
+            signal: controller.signal
+        });
+
+        if (!res.ok && res.status !== 206) {
+            throw new Error(`HTTP ${res.status}`);
+        }
+
+        const cType = (res.headers.get('content-type') || '').toLowerCase();
+        if (cType.includes('text/html') || cType.includes('application/json')) {
+            throw new Error(`Invalid content-type: ${cType}`);
+        }
+
+        const fileStream = fs.createWriteStream(tmpInput);
+        let downloaded = 0;
+
+        for await (const chunk of res.body) {
+            downloaded += chunk.length;
+            fileStream.write(chunk);
+            if (downloaded >= maxBytes) {
+                try { controller.abort(); } catch (e) {}
+                break;
+            }
+        }
+
+        await new Promise(resolve => fileStream.end(resolve));
+        clearTimeout(timeoutId);
+
+        if (downloaded < 8000) {
+            throw new Error(`Downloaded file too small (${downloaded} bytes)`);
+        }
+
+        console.log(`[Node Download] Downloaded ${downloaded} bytes to local disk. Running local FFmpeg...`);
+
+        // כעת FFmpeg קורא קובץ מקומי מהדיסק ולא מהאינטרנט - לעולם לא יקרוס עם SIGSEGV!
+        await new Promise((resolve, reject) => {
+            const ffTimer = setTimeout(() => reject(new Error('Local FFmpeg timeout')), 12000);
+            ffmpeg(tmpInput)
+                .format('wav')
+                .audioCodec('pcm_s16le')
+                .audioChannels(1)
+                .audioFrequency(8000)
+                .duration(600)
+                .on('end', () => {
+                    clearTimeout(ffTimer);
+                    resolve();
+                })
+                .on('error', (err) => {
+                    clearTimeout(ffTimer);
+                    reject(err);
+                })
+                .save(outputWavPath);
+        });
+
+        fs.promises.unlink(tmpInput).catch(() => null);
+        return true;
+
+    } catch (err) {
+        clearTimeout(timeoutId);
+        fs.promises.unlink(tmpInput).catch(() => null);
+        throw err;
+    }
 }
 
-// 5. הורדה חסינת-חסימות והעלאה ישירה לשלוחה בימות המשיח
+// 5. הורדה, המרה מקומית והעלאה ישירה לימות המשיח
 async function downloadAndUploadToYemot(videoId, apiExtension) {
     const tmpWav = path.join(os.tmpdir(), `ym_${videoId}_${Date.now()}.wav`);
     const extFolder = String(apiExtension || '9').replace(/^ivr2:\/*/, '').replace(/^\/*/, '').replace(/\/*$/, '');
@@ -290,133 +309,30 @@ async function downloadAndUploadToYemot(videoId, apiExtension) {
     const playFileCommand = extFolder ? `f-/${extFolder}/100` : `f-/100`;
 
     try {
+        console.log(`[Step 5 Audio] Fetching proxy URLs for ${videoId}...`);
+        const proxyUrls = await getProxyAudioUrls(videoId);
         let converted = false;
 
-        // שלב א: ניסיון מהיר דרך @distube/ytdl-core עם לקוח ANDROID_VR / IOS
-        try {
-            console.log(`[Step 5 Audio] Trying @distube/ytdl-core for ${videoId}...`);
-            await new Promise((resolve, reject) => {
-                const audioStream = ytdl(`https://www.youtube.com/watch?v=${videoId}`, {
-                    filter: 'audioonly',
-                    quality: 'lowestaudio'
-                });
-                const t = setTimeout(() => {
-                    try { audioStream.destroy(); } catch (e) {}
-                    reject(new Error('ytdl-core timeout'));
-                }, 14000);
-
-                audioStream.on('error', (err) => {
-                    clearTimeout(t);
-                    reject(err);
-                });
-
-                ffmpeg(audioStream)
-                    .format('wav')
-                    .audioCodec('pcm_s16le')
-                    .audioChannels(1)
-                    .audioFrequency(8000)
-                    .duration(480)
-                    .on('end', () => {
-                        clearTimeout(t);
-                        resolve();
-                    })
-                    .on('error', (err) => {
-                        clearTimeout(t);
-                        reject(err);
-                    })
-                    .save(tmpWav);
-            });
-
-            if (fs.existsSync(tmpWav) && fs.statSync(tmpWav).size > 5000) {
-                console.log('[Step 5 Audio] Success via @distube/ytdl-core!');
-                converted = true;
-            }
-        } catch (ytdlErr) {
-            console.warn('[Step 5 Audio] ytdl-core failed:', ytdlErr.message.slice(0, 180));
-        }
-
-        // שלב ב: ניסיון דרך yt-dlp עם לקוח ANDROID_VR (עוקף דרישת Cookies ברוב שרתי הענן)
-        if (!converted) {
-            const vrProfiles = [
-                'youtube:player_client=android_vr',
-                'youtube:player_client=android_testsuite',
-                'youtube:player_client=mediaconnect'
-            ];
-            for (const profile of vrProfiles) {
-                if (converted) break;
-                try {
-                    console.log(`[Step 5 Audio] Trying yt-dlp profile ${profile}...`);
-                    await new Promise((resolve, reject) => {
-                        const subprocess = ytDlp.exec(`https://www.youtube.com/watch?v=${videoId}`, {
-                            output: '-',
-                            format: 'worstaudio/bestaudio',
-                            noWarnings: true,
-                            noCheckCertificates: true,
-                            extractorArgs: profile
-                        }, { stdio: ['ignore', 'pipe', 'pipe'] });
-
-                        let stderrLog = '';
-                        subprocess.stderr.on('data', d => { stderrLog += d.toString(); });
-
-                        const timeoutId = setTimeout(() => {
-                            try { subprocess.kill(); } catch (e) {}
-                            reject(new Error('yt-dlp VR timeout'));
-                        }, 14000);
-
-                        ffmpeg(subprocess.stdout)
-                            .format('wav')
-                            .audioCodec('pcm_s16le')
-                            .audioChannels(1)
-                            .audioFrequency(8000)
-                            .duration(480)
-                            .on('end', () => {
-                                clearTimeout(timeoutId);
-                                try { subprocess.kill(); } catch (e) {}
-                                resolve();
-                            })
-                            .on('error', (err) => {
-                                clearTimeout(timeoutId);
-                                try { subprocess.kill(); } catch (e) {}
-                                reject(new Error(err.message + ' | ' + stderrLog.slice(-150)));
-                            })
-                            .save(tmpWav);
-                    });
-
-                    if (fs.existsSync(tmpWav) && fs.statSync(tmpWav).size > 5000) {
-                        console.log(`[Step 5 Audio] Success via ${profile}!`);
-                        converted = true;
-                    }
-                } catch (vrErr) {
-                    console.warn(`[Step 5 Audio] ${profile} failed:`, vrErr.message.slice(0, 180));
+        for (const pUrl of proxyUrls.slice(0, 6)) {
+            if (converted) break;
+            try {
+                console.log(`[Step 5 Audio] Downloading via Node from: ${pUrl.slice(0, 85)}...`);
+                await downloadViaNodeAndConvertToWav(pUrl, tmpWav);
+                if (fs.existsSync(tmpWav) && fs.statSync(tmpWav).size > 5000) {
+                    console.log(`[Step 5 Audio] Local WAV created successfully (${fs.statSync(tmpWav).size} bytes)!`);
+                    converted = true;
                 }
-            }
-        }
-
-        // שלב ג: עקיפה מלאה דרך שרתי פרוקסי חיצוניים (Invidious local=true / Piped)
-        if (!converted) {
-            console.log('[Step 5 Audio] Fetching proxy audio URLs to bypass Render IP block...');
-            const proxyUrls = await getProxyAudioUrls(videoId);
-            for (const pUrl of proxyUrls.slice(0, 5)) {
-                if (converted) break;
-                try {
-                    console.log(`[Step 5 Audio] Converting from proxy URL: ${pUrl.slice(0, 80)}...`);
-                    await convertSourceToWav(pUrl, tmpWav, 480);
-                    if (fs.existsSync(tmpWav) && fs.statSync(tmpWav).size > 5000) {
-                        console.log('[Step 5 Audio] Success via Proxy URL!');
-                        converted = true;
-                    }
-                } catch (pErr) {
-                    console.warn('[Step 5 Audio] Proxy URL attempt failed:', pErr.message.slice(0, 150));
-                }
+            } catch (pErr) {
+                console.warn(`[Step 5 Audio] Attempt failed (${pErr.message})`);
             }
         }
 
         if (!converted) {
-            throw new Error('All extraction and proxy methods failed');
+            throw new Error('All proxy download attempts failed');
         }
 
         const wavBuffer = await fs.promises.readFile(tmpWav);
-        console.log(`[Step 5 Upload] WAV ready (${wavBuffer.length} bytes). Uploading to ${yemotTargetPath}...`);
+        console.log(`[Step 5 Upload] Uploading ${wavBuffer.length} bytes to Yemot (${yemotTargetPath})...`);
 
         const formData = new FormData();
         formData.append('token', TOKEN);
@@ -441,7 +357,7 @@ async function downloadAndUploadToYemot(videoId, apiExtension) {
     }
 }
 
-app.get('/', (req, res) => { res.send('YouTube Line Server v8.0 OK - Anti-Block Proxy Engine'); });
+app.get('/', (req, res) => { res.send('YouTube Line Server v9.0 OK - Node Stream Downloader (No SIGSEGV)'); });
 
 app.all(['/yemot', '/yemot/:e'], async (req, res) => {
     const q = { ...req.query, ...req.body };
@@ -475,6 +391,10 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
             return res.send('id_list_message=t-שגיאה בתקשורת עם מנוע זיהוי הדיבור&go_to_folder=/');
         }
 
+        if (rawText.includes('BLOCKED')) {
+            return res.send('id_list_message=t-המערכת מיועדת לחיפוש שיעורי תורה בלבד&go_to_folder=/');
+        }
+
         const cleanQuery = rawText.replace(/[^א-תa-zA-Z0-9\s]/g, ' ').trim().replace(/\s+/g, ' ');
         console.log('[Step 3 Clean Query]', cleanQuery);
 
@@ -500,18 +420,18 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
         const title = (ytData.items[0].snippet.title || '').replace(/[^א-תa-zA-Z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
         console.log(`[Step 4 Match] Video ${videoId}: ${title}`);
 
-        // שלב 5: הורדה עוקפת חסימות והעלאה ישירה לימות המשיח
+        // שלב 5: הורדה דרך Node.js, המרה מקומית ל-WAV והעלאה לימות המשיח
         try {
             const playCmd = await downloadAndUploadToYemot(videoId, q.ApiExtension);
             console.log(`[Step 5 Ready] Sending play command: ${playCmd}`);
             return res.send(`id_list_message=t-משמיע ${title}.${playCmd}&go_to_folder=/`);
         } catch (audioErr) {
             console.error('[Step 5 Error]', audioErr.message);
-            return res.send(`id_list_message=t-נמצא השיעור ${title} אך שרת ההורדה חסום כעת&go_to_folder=/`);
+            return res.send(`id_list_message=t-נמצא השיעור ${title} אך אירעה שגיאה בטעינת הקובץ&go_to_folder=/`);
         }
 
     } catch (e) {
-        console.error('[General Error v8.0]', e.message);
+        console.error('[General Error v9.0]', e.message);
         if (!res.headersSent) {
             return res.send('id_list_message=t-אירעה תקלה כללית בשרת&go_to_folder=/');
         }
@@ -519,4 +439,4 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
 });
 
 const port = process.env.PORT || 3000;
-app.listen(port, () => console.log(`=== Server v8.0 Ready on port ${port} ===`));
+app.listen(port, () => console.log(`=== Server v9.0 Ready on port ${port} ===`));
