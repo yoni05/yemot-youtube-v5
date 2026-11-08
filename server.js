@@ -36,7 +36,7 @@ async function fetchWithTimeout(url, options = {}, timeout = 20000) {
     }
 }
 
-// איתור המספר הפנוי הבא בתיקייה בימות המשיח (למניעת דריסת קבצים)
+// איתור המספר הפנוי הבא בתיקייה בימות המשיח (תומך בשריון מספר קבצים עוקבים עבור חלקי השיעור!)
 async function getNextFileNumberStr(folder, reserveCount = 1) {
     const cleanFolder = String(folder || '').replace(/^ivr2:\/*/, '').replace(/^\/*/, '').replace(/\/*$/, '');
     const folderPath = cleanFolder ? `ivr2:/${cleanFolder}` : `ivr2:/`;
@@ -102,7 +102,7 @@ async function getExtensionLatestAudioFile(extFolder) {
     return null;
 }
 
-// העלאת קובץ WAV מוכן לימות המשיח (ללא צורך בהמרה בצד של ימות המשיח - מהיר פי 10!)
+// העלאת קובץ WAV מוכן לימות המשיח
 async function uploadWavBufferToExactPath(wavBuffer, exactTargetPath, fileNameLabel = 'audio.wav', timeoutMs = 45000) {
     const formData = new FormData();
     formData.append('token', TOKEN);
@@ -276,17 +276,19 @@ async function transcribeAudio(audioBase64) {
     throw new Error('GEMINI_ERR: ' + lastErr);
 }
 
-// 3. המרה מהירה במיוחד לקובץ WAV תקני לימות המשיח (8000Hz Mono PCM)
-// המרת WAV לוקחת ב-Render רק 1-2 שניות כי אין צורך בדחיסת MP3 כבדה!
-async function convertLocalFileToWavFast(inputPath, outputWavPath, maxDurationSec = 3600) {
+// 3. חיתוך והמרה מהירה של מקטע ספציפי (startSec עד startSec + durationSec) לקובץ WAV תקני לימות המשיח (8000Hz Mono PCM)
+async function convertSegmentToWavFast(inputPath, outputWavPath, startSec = 0, durationSec = 900) {
     await new Promise((resolve, reject) => {
-        const ffTimer = setTimeout(() => reject(new Error('Local FFmpeg timeout')), 25000);
-        ffmpeg(inputPath)
+        const ffTimer = setTimeout(() => reject(new Error('Local FFmpeg segment timeout')), 25000);
+        let cmd = ffmpeg(inputPath);
+        if (startSec > 0) {
+            cmd = cmd.setStartTime(startSec);
+        }
+        cmd.duration(durationSec)
             .format('wav')
             .audioCodec('pcm_s16le')
             .audioChannels(1)
             .audioFrequency(8000)
-            .duration(maxDurationSec)
             .on('end', () => {
                 clearTimeout(ffTimer);
                 resolve();
@@ -320,7 +322,6 @@ async function getFastStreamUrls(videoId) {
                 const data = await apiRes.json();
                 const formats = (data.adaptiveFormats || []).filter(f => (f.type || '').startsWith('audio/'));
                 if (formats.length > 0) {
-                    // מיון מהנפח הקטן ביותר (itag 139 / 48kbps) כדי שההורדה תסתיים בשניות בודדות!
                     formats.sort((a, b) => (parseInt(a.bitrate) || 999999) - (parseInt(b.bitrate) || 999999));
                     for (const fmt of formats.slice(0, 2)) {
                         const itag = fmt.itag || 139;
@@ -342,7 +343,7 @@ async function getFastStreamUrls(videoId) {
     return [...new Set(urls)];
 }
 
-// 5. הורדה מואצת במקטעים (Chunked Range Download) שעוקפת את הגבלת המהירות של יוטיוב!
+// 5. הורדה מואצת במקטעים (Chunked Range Download)
 async function downloadStreamFastToLocalFile(streamUrl, targetFilePath, maxBytes, timeoutMs = 15000) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -392,14 +393,22 @@ async function downloadStreamFastToLocalFile(streamUrl, targetFilePath, maxBytes
     }
 }
 
-// 6. הורדה דו-שלבית חכמה:
-// שלב א' (מיידי - תוך כ-4 שניות): מוריד את 15 הדקות הראשונות (5MB ב-itag 139) כדי שהמאזין בטלפון יתחיל לשמוע מיד ללא המתנה!
-// שלב ב' (ברקע בזמן שהמאזין כבר מקשיב): מוריד את השיעור המלא (עד שעה שלמה - 22MB) ומעדכן את הקובץ בשלוחה!
-async function downloadAndUploadFastWithFullBackground(videoId, apiExtension, title, phone) {
+// 6. הורדה והשמעה רציפה ללא עצירה לאחר 15 דקות!
+// משריין מראש 4 מספרי קבצים עוקבים (למשל 001, 002, 003, 004):
+// - מעלה מיד תוך שניות את חלק 1 (00:00 עד 15:00) לקובץ הראשון (001.wav).
+// - מחזיר לימות המשיח פקודה מרובת קבצים ברצף: f-/9/001.f-/9/002.f-/9/003.f-/9/004
+// - בזמן שהמאזין מקשיב ל-15 הדקות הראשונות (001), השרת מוריד ברקע את ההמשך ומעלה את חלק 2 (15:00-30:00), חלק 3 (30:00-45:00) וחלק 4 (45:00-60:00)!
+// כך כשמסתיים חלק 1 לאחר 15 דקות, ימות המשיח עוברת אוטומטית לחלק 2, 3 ו-4 ברצף חלק!
+async function downloadAndUploadChainedParts(videoId, apiExtension, title, phone) {
     const extFolder = String(apiExtension || '9').replace(/^ivr2:\/*/, '').replace(/^\/*/, '').replace(/\/*$/, '');
-    const nextExtNum = await getNextFileNumberStr(extFolder, 1);
-    const yemotTargetPath = extFolder ? `ivr2:/${extFolder}/${nextExtNum}.wav` : `ivr2:/${nextExtNum}.wav`;
-    const playFileCommand = extFolder ? `f-/${extFolder}/${nextExtNum}` : `f-/${nextExtNum}`;
+    
+    // שריון 4 מספרי קבצים עוקבים עבור 4 חלקי השיעור (4 x 15 דקות = 60 דקות רצופות)
+    const partNums = await getNextFileNumberStr(extFolder, 4);
+    const partPaths = partNums.map(num => extFolder ? `ivr2:/${extFolder}/${num}.wav` : `ivr2:/${num}.wav`);
+    const partCmds = partNums.map(num => extFolder ? `f-/${extFolder}/${num}` : `f-/${num}`);
+    
+    // שרשור כל 4 החלקים בפקודת ההשמעה של ימות המשיח
+    const chainedPlayCommand = partCmds.join('.');
 
     const streamUrls = await getFastStreamUrls(videoId);
     let workingUrl = null;
@@ -407,34 +416,34 @@ async function downloadAndUploadFastWithFullBackground(videoId, apiExtension, ti
     const tmpQuickWav = path.join(os.tmpdir(), `quick_out_${videoId}_${Date.now()}.wav`);
 
     try {
-        // שלב א': הורדה מהירה של ~5MB ראשונים (כ-15 דקות של שיעור) תוך שניות בודדות!
+        // שלב א' (מיידי): הורדת 5.5MB ראשונים (חלק 1: דקות 0 עד 15) תוך שניות בודדות
         for (const sUrl of streamUrls.slice(0, 6)) {
             try {
-                console.log(`[Fast Start] Downloading initial 5MB from: ${sUrl.slice(0, 80)}...`);
-                const bytes = await downloadStreamFastToLocalFile(sUrl, tmpQuickInput, 5 * 1024 * 1024, 9000);
-                console.log(`[Fast Start] Got ${bytes} bytes in seconds. Converting to WAV...`);
-                await convertLocalFileToWavFast(tmpQuickInput, tmpQuickWav, 900);
+                console.log(`[Part 1 Fast Start] Downloading initial 5.5MB from: ${sUrl.slice(0, 80)}...`);
+                const bytes = await downloadStreamFastToLocalFile(sUrl, tmpQuickInput, 5.5 * 1024 * 1024, 9000);
+                console.log(`[Part 1 Fast Start] Got ${bytes} bytes. Converting Part 1 (0-15m) to WAV...`);
+                await convertSegmentToWavFast(tmpQuickInput, tmpQuickWav, 0, 900);
                 if (fs.existsSync(tmpQuickWav) && fs.statSync(tmpQuickWav).size > 20000) {
                     workingUrl = sUrl;
                     break;
                 }
             } catch (err) {
-                console.warn(`[Fast Start] URL attempt failed: ${err.message}`);
+                console.warn(`[Part 1 Fast Start] URL attempt failed: ${err.message}`);
             }
         }
 
-        // אם שרתי ה-Proxy לא החזירו תוך 9 שניות, ננסה @distube/ytdl-core מהיר ל-5MB ראשונים
+        // גיבוי דרך ytdl-core אם הפרוקסי התעכב
         if (!workingUrl) {
-            console.log('[Fast Start] Trying ytdl-core fast 5MB...');
+            console.log('[Part 1 Fast Start] Trying ytdl-core fast 5.5MB...');
             await new Promise((resolve, reject) => {
                 let dl = 0;
                 const ws = fs.createWriteStream(tmpQuickInput);
                 const st = ytdl(`https://www.youtube.com/watch?v=${videoId}`, { filter: 'audioonly', quality: 'lowestaudio' });
-                const tm = setTimeout(() => { try { st.destroy(); } catch (e) {} ws.end(resolve); }, 8000);
+                const tm = setTimeout(() => { try { st.destroy(); } catch (e) {} ws.end(resolve); }, 8500);
                 st.on('data', c => {
                     dl += c.length;
                     ws.write(c);
-                    if (dl >= 4 * 1024 * 1024) {
+                    if (dl >= 5 * 1024 * 1024) {
                         clearTimeout(tm);
                         try { st.destroy(); } catch (e) {}
                         ws.end(resolve);
@@ -443,44 +452,90 @@ async function downloadAndUploadFastWithFullBackground(videoId, apiExtension, ti
                 st.on('end', () => { clearTimeout(tm); ws.end(resolve); });
                 st.on('error', e => { clearTimeout(tm); ws.end(() => reject(e)); });
             });
-            await convertLocalFileToWavFast(tmpQuickInput, tmpQuickWav, 900);
+            await convertSegmentToWavFast(tmpQuickInput, tmpQuickWav, 0, 900);
         }
 
+        // העלאת חלק 1 (0-15 דקות) לקובץ הראשון (partPaths[0])
         const quickWavBuf = await fs.promises.readFile(tmpQuickWav);
-        await uploadWavBufferToExactPath(quickWavBuf, yemotTargetPath, `${nextExtNum}.wav`, 20000);
+        await uploadWavBufferToExactPath(quickWavBuf, partPaths[0], `${partNums[0]}.wav`, 20000);
 
-        const savedInfo = { playCmd: playFileCommand, title: title || 'השיעור הקודם', time: Date.now() };
+        const savedInfo = { playCmd: chainedPlayCommand, title: title || 'השיעור הקודם', time: Date.now() };
         if (phone) lastDownloadByPhone.set(phone, savedInfo);
         globalLastDownload = savedInfo;
 
         fs.promises.unlink(tmpQuickInput).catch(() => null);
         fs.promises.unlink(tmpQuickWav).catch(() => null);
 
-        // שלב ב' (ברקע): בזמן שהמאזין כבר שומע את השיעור בטלפון, השרת מוריד את השיעור המלא (עד 25MB = שעה שלמה ב-48kbps)
-        // ושומר אותו בשלוחה כדי שהשיעור המלא יהיה זמין במלואו ללא שום המתנה בקו!
-        if (workingUrl) {
-            (async () => {
-                const tmpFullIn = path.join(os.tmpdir(), `full_in_${videoId}_${Date.now()}.audio`);
-                const tmpFullWav = path.join(os.tmpdir(), `full_out_${videoId}_${Date.now()}.wav`);
-                try {
-                    console.log(`[Background Full Download] Downloading full lesson in background for ${yemotTargetPath}...`);
-                    const fullBytes = await downloadStreamFastToLocalFile(workingUrl, tmpFullIn, 24 * 1024 * 1024, 45000);
-                    if (fullBytes > 5.5 * 1024 * 1024) {
-                        await convertLocalFileToWavFast(tmpFullIn, tmpFullWav, 2700); // עד 45 דקות ב-WAV תקני (~43MB - מתחת למגבלת 50MB של ימות)
-                        const fullWavBuf = await fs.promises.readFile(tmpFullWav);
-                        await uploadWavBufferToExactPath(fullWavBuf, yemotTargetPath, `${nextExtNum}.wav`, 60000);
-                        console.log(`[Background Full Download] Updated ${yemotTargetPath} with full lesson (${fullWavBuf.length} bytes)!`);
-                    }
-                } catch (bgErr) {
-                    console.warn('[Background Full Download] Info:', bgErr.message);
-                } finally {
-                    fs.promises.unlink(tmpFullIn).catch(() => null);
-                    fs.promises.unlink(tmpFullWav).catch(() => null);
-                }
-            })();
-        }
+        // שלב ב' (ברקע בזמן שהמאזין מקשיב לחלק 1):
+        // מוריד את הקובץ המלא ומייצר את חלק 2 (15-30 דק'), חלק 3 (30-45 דק') וחלק 4 (45-60 דק')
+        (async () => {
+            const tmpFullIn = path.join(os.tmpdir(), `full_in_${videoId}_${Date.now()}.audio`);
+            try {
+                console.log(`[Background Parts 2-4] Downloading full audio stream for parts ${partNums.slice(1).join(', ')}...`);
+                let fullBytes = 0;
 
-        return playFileCommand;
+                if (workingUrl) {
+                    fullBytes = await downloadStreamFastToLocalFile(workingUrl, tmpFullIn, 26 * 1024 * 1024, 55000);
+                } else {
+                    await new Promise((resolve, reject) => {
+                        const ws = fs.createWriteStream(tmpFullIn);
+                        const st = ytdl(`https://www.youtube.com/watch?v=${videoId}`, { filter: 'audioonly', quality: 'lowestaudio' });
+                        const tm = setTimeout(() => { try { st.destroy(); } catch (e) {} ws.end(resolve); }, 55000);
+                        st.on('data', c => {
+                            fullBytes += c.length;
+                            ws.write(c);
+                            if (fullBytes >= 26 * 1024 * 1024) {
+                                clearTimeout(tm);
+                                try { st.destroy(); } catch (e) {}
+                                ws.end(resolve);
+                            }
+                        });
+                        st.on('end', () => { clearTimeout(tm); ws.end(resolve); });
+                        st.on('error', e => { clearTimeout(tm); ws.end(() => reject(e)); });
+                    });
+                }
+
+                console.log(`[Background Parts 2-4] Full stream downloaded (${fullBytes} bytes). Splitting into sequential 15-min parts...`);
+
+                // חיתוך והעלאה של חלקים 2, 3 ו-4 (דקות 15-30, 30-45, 45-60)
+                const segments = [
+                    { index: 1, start: 900, duration: 900, label: 'Part 2 (15m-30m)' },
+                    { index: 2, start: 1800, duration: 900, label: 'Part 3 (30m-45m)' },
+                    { index: 3, start: 2700, duration: 900, label: 'Part 4 (45m-60m)' }
+                ];
+
+                for (const seg of segments) {
+                    const tmpPartWav = path.join(os.tmpdir(), `part_${seg.index}_${videoId}_${Date.now()}.wav`);
+                    try {
+                        await convertSegmentToWavFast(tmpFullIn, tmpPartWav, seg.start, seg.duration);
+                        if (fs.existsSync(tmpPartWav)) {
+                            const stat = fs.statSync(tmpPartWav);
+                            // אם החלק מכיל תוכן ממשי (מעל 5 שניות שמע = ~80KB), נעלה אותו לשלוחה
+                            if (stat.size > 80000) {
+                                const partBuf = await fs.promises.readFile(tmpPartWav);
+                                await uploadWavBufferToExactPath(partBuf, partPaths[seg.index], `${partNums[seg.index]}.wav`, 40000);
+                                console.log(`[Background ${seg.label}] Uploaded successfully to ${partPaths[seg.index]} (${partBuf.length} bytes)!`);
+                            } else {
+                                console.log(`[Background ${seg.label}] Lesson ended before ${seg.start}s, skipping remaining parts.`);
+                                fs.promises.unlink(tmpPartWav).catch(() => null);
+                                break;
+                            }
+                        }
+                    } catch (segErr) {
+                        console.log(`[Background ${seg.label}] Reached end of audio or error:`, segErr.message);
+                        fs.promises.unlink(tmpPartWav).catch(() => null);
+                        break;
+                    }
+                    fs.promises.unlink(tmpPartWav).catch(() => null);
+                }
+            } catch (bgErr) {
+                console.warn('[Background Parts 2-4] Warning:', bgErr.message);
+            } finally {
+                fs.promises.unlink(tmpFullIn).catch(() => null);
+            }
+        })();
+
+        return chainedPlayCommand;
 
     } catch (e) {
         fs.promises.unlink(tmpQuickInput).catch(() => null);
@@ -489,7 +544,7 @@ async function downloadAndUploadFastWithFullBackground(videoId, apiExtension, ti
     }
 }
 
-app.get('/', (req, res) => { res.send('YouTube Line Server v12.0 OK - Instant Start + Full Background Lesson + Ext 8 Text + Ext 9 Voice'); });
+app.get('/', (req, res) => { res.send('YouTube Line Server v12.1 OK - Seamless Multi-Part Chained Playback'); });
 
 app.all(['/yemot', '/yemot/:e'], async (req, res) => {
     const q = { ...req.query, ...req.body };
@@ -508,7 +563,7 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
             return res.send('read=t-לחיפוש חדש הקישו 1 להאזנה להורדה הקודמת הקישו 2=MenuChoice,no,1,1,7,Digits,no');
         }
 
-        // הקשה על 2 -> השמעת ההורדה הקודמת מיד
+        // הקשה על 2 -> השמעת ההורדה הקודמת (כולל כל החלקים המשורשרים שלה ברצף!)
         if (q.MenuChoice === '2' && !q.RecordPath) {
             let prev = (callerPhone && lastDownloadByPhone.get(callerPhone)) || globalLastDownload;
             if (!prev) {
@@ -523,7 +578,7 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
             } else {
                 const recNum = await getNextFileNumberStr(extFolder, 1);
                 const recFolder = extFolder ? `/${extFolder}` : '';
-                return res.send(`id_list_message=t-עדיין לא קיימת הורדה קודמת בקו&read=t-אנא אמרו את שם הערך המבוקש ובסיום הקישו סולמית=RecordPath,no,record,${recFolder},${recNum},no,7,1`);
+                return res.send(`id_list_message=t-עדיין לא קיימת הורדה קודמת בקו&read=t-אנא אמרו את שם השיעור המבוקש ובסיום הקישו סולמית=RecordPath,no,record,${recFolder},${recNum},no,7,1`);
             }
         }
 
@@ -531,7 +586,7 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
         if (!q.RecordPath) {
             const recNum = await getNextFileNumberStr(extFolder, 1);
             const recFolder = extFolder ? `/${extFolder}` : '';
-            return res.send(`read=t-אנא אמרו את שם הערך המבוקש ובסיום הקישו סולמית=RecordPath,no,record,${recFolder},${recNum},no,7,1`);
+            return res.send(`read=t-אנא אמרו את שם השיעור המבוקש ובסיום הקישו סולמית=RecordPath,no,record,${recFolder},${recNum},no,7,1`);
         }
 
         // שלב 2: הורדת ההקלטה משלוחה 9
@@ -580,18 +635,18 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
         const title = (ytData.items[0].snippet.title || '').replace(/[^א-תa-zA-Z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
         console.log(`[Step 4 Match] Video ${videoId}: ${title}`);
 
-        // שלב 5: הורדה מהירה במיוחד (תוך שניות בודדות) + השלמת השיעור המלא ברקע
+        // שלב 5: הורדת חלק 1 תוך שניות + שרשור אוטומטי של חלקים 2, 3 ו-4 שיורדים ברקע!
         try {
-            const playCmd = await downloadAndUploadFastWithFullBackground(videoId, q.ApiExtension, title, callerPhone);
-            console.log(`[Step 5 Ready] Sending play command immediately: ${playCmd}`);
-            return res.send(`id_list_message=t-משמיע ${title}.${playCmd}&go_to_folder=/`);
+            const chainedPlayCmd = await downloadAndUploadChainedParts(videoId, q.ApiExtension, title, callerPhone);
+            console.log(`[Step 5 Ready] Sending chained play command: ${chainedPlayCmd}`);
+            return res.send(`id_list_message=t-משמיע ${title}.${chainedPlayCmd}&go_to_folder=/`);
         } catch (audioErr) {
             console.error('[Step 5 Error]', audioErr.message);
             return res.send(`id_list_message=t-נמצא ${title} אך אירעה שגיאה בטעינת הקובץ&go_to_folder=/`);
         }
 
     } catch (e) {
-        console.error('[General Error v12.0]', e.message);
+        console.error('[General Error v12.1]', e.message);
         if (!res.headersSent) {
             return res.send('id_list_message=t-אירעה תקלה כללית בשרת&go_to_folder=/');
         }
@@ -599,4 +654,4 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
 });
 
 const port = process.env.PORT || 3000;
-app.listen(port, () => console.log(`=== Server v12.0 Ready on port ${port} ===`));
+app.listen(port, () => console.log(`=== Server v12.1 Ready on port ${port} ===`));
