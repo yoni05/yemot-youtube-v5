@@ -16,7 +16,7 @@ const TOKEN = (process.env.YEMOT_TOKEN || '').trim();
 const GEMINI_KEY = (process.env.GEMINI_API_KEY || '').trim();
 const YT_KEY = (process.env.YOUTUBE_API_KEY || '').trim();
 const YM = 'https://www.call2all.co.il/ym/api/';
-const TEXT_ARCHIVE_EXT = '8'; // שלוחה 8 לשמירת קובצי הטקסט של זיהוי הדיבור
+const TEXT_ARCHIVE_EXT = '8'; // שלוחה 8 לשמירת קובצי הטקסט וכל הקבצים שיורדים
 
 let cachedModelName = null;
 const lastDownloadByPhone = new Map();
@@ -393,16 +393,11 @@ async function downloadStreamFastToLocalFile(streamUrl, targetFilePath, maxBytes
     }
 }
 
-// 6. הורדה והשמעה רציפה ללא עצירה לאחר 15 דקות!
-// משריין מראש 4 מספרי קבצים עוקבים (למשל 001, 002, 003, 004):
-// - מעלה מיד תוך שניות את חלק 1 (00:00 עד 15:00) לקובץ הראשון (001.wav).
-// - מחזיר לימות המשיח פקודה מרובת קבצים ברצף: f-/9/001.f-/9/002.f-/9/003.f-/9/004
-// - בזמן שהמאזין מקשיב ל-15 הדקות הראשונות (001), השרת מוריד ברקע את ההמשך ומעלה את חלק 2 (15:00-30:00), חלק 3 (30:00-45:00) וחלק 4 (45:00-60:00)!
-// כך כשמסתיים חלק 1 לאחר 15 דקות, ימות המשיח עוברת אוטומטית לחלק 2, 3 ו-4 ברצף חלק!
+// 6. הורדה והשמעה רציפה ללא עצירה לאחר 15 דקות + העברה לשלוחה 8 בסדר הפוך (החלק האחרון נכנס ראשון והחלק הראשון נכנס אחרון)!
 async function downloadAndUploadChainedParts(videoId, apiExtension, title, phone) {
     const extFolder = String(apiExtension || '9').replace(/^ivr2:\/*/, '').replace(/^\/*/, '').replace(/\/*$/, '');
     
-    // שריון 4 מספרי קבצים עוקבים עבור 4 חלקי השיעור (4 x 15 דקות = 60 דקות רצופות)
+    // שריון 4 מספרי קבצים עוקבים עבור 4 חלקי השיעור בשלוחת החיפוש (4 x 15 דקות = 60 דקות רצופות)
     const partNums = await getNextFileNumberStr(extFolder, 4);
     const partPaths = partNums.map(num => extFolder ? `ivr2:/${extFolder}/${num}.wav` : `ivr2:/${num}.wav`);
     const partCmds = partNums.map(num => extFolder ? `f-/${extFolder}/${num}` : `f-/${num}`);
@@ -455,7 +450,7 @@ async function downloadAndUploadChainedParts(videoId, apiExtension, title, phone
             await convertSegmentToWavFast(tmpQuickInput, tmpQuickWav, 0, 900);
         }
 
-        // העלאת חלק 1 (0-15 דקות) לקובץ הראשון (partPaths[0])
+        // העלאת חלק 1 (0-15 דקות) לקובץ הראשון בשלוחה 9 (partPaths[0])
         const quickWavBuf = await fs.promises.readFile(tmpQuickWav);
         await uploadWavBufferToExactPath(quickWavBuf, partPaths[0], `${partNums[0]}.wav`, 20000);
 
@@ -467,9 +462,15 @@ async function downloadAndUploadChainedParts(videoId, apiExtension, title, phone
         fs.promises.unlink(tmpQuickWav).catch(() => null);
 
         // שלב ב' (ברקע בזמן שהמאזין מקשיב לחלק 1):
-        // מוריד את הקובץ המלא ומייצר את חלק 2 (15-30 דק'), חלק 3 (30-45 דק') וחלק 4 (45-60 דק')
+        // מוריד את הקובץ המלא, מייצר את חלקים 2, 3 ו-4 לשלוחה 9,
+        // ולאחר מכן מעביר את כל החלקים לשלוחה 8 מהסוף להתחלה (החלק האחרון נכנס ראשון והחלק הראשון נכנס אחרון)!
         (async () => {
             const tmpFullIn = path.join(os.tmpdir(), `full_in_${videoId}_${Date.now()}.audio`);
+            // מערך לשמירת כל החלקים של ההורדה הנוכחית לפי הסדר (חלק 1 כבר בפנים)
+            const allPartsForExt8 = [
+                { partNumber: 1, buffer: quickWavBuf }
+            ];
+
             try {
                 console.log(`[Background Parts 2-4] Downloading full audio stream for parts ${partNums.slice(1).join(', ')}...`);
                 let fullBytes = 0;
@@ -510,11 +511,12 @@ async function downloadAndUploadChainedParts(videoId, apiExtension, title, phone
                         await convertSegmentToWavFast(tmpFullIn, tmpPartWav, seg.start, seg.duration);
                         if (fs.existsSync(tmpPartWav)) {
                             const stat = fs.statSync(tmpPartWav);
-                            // אם החלק מכיל תוכן ממשי (מעל 5 שניות שמע = ~80KB), נעלה אותו לשלוחה
+                            // אם החלק מכיל תוכן ממשי (מעל 5 שניות שמע = ~80KB), נעלה אותו לשלוחה 9 ונוסיף לרשימת ההעברה לשלוחה 8
                             if (stat.size > 80000) {
                                 const partBuf = await fs.promises.readFile(tmpPartWav);
                                 await uploadWavBufferToExactPath(partBuf, partPaths[seg.index], `${partNums[seg.index]}.wav`, 40000);
                                 console.log(`[Background ${seg.label}] Uploaded successfully to ${partPaths[seg.index]} (${partBuf.length} bytes)!`);
+                                allPartsForExt8.push({ partNumber: seg.index + 1, buffer: partBuf });
                             } else {
                                 console.log(`[Background ${seg.label}] Lesson ended before ${seg.start}s, skipping remaining parts.`);
                                 fs.promises.unlink(tmpPartWav).catch(() => null);
@@ -533,6 +535,28 @@ async function downloadAndUploadChainedParts(videoId, apiExtension, title, phone
             } finally {
                 fs.promises.unlink(tmpFullIn).catch(() => null);
             }
+
+            // העברת כל הקבצים שירדו לשלוחה 8 בסדר הפוך:
+            // החלק האחרון נכנס ראשון לשלוחה 8 (מקבל את המספר הנמוך יותר) והחלק הראשון נכנס אחרון (מקבל את המספר הגבוה ביותר),
+            // כך שכשנכנסים לשלוחה 8 (שמשמיעה קבצים מהחדש לישן), הקובץ יושמע בדיוק לפי הסדר המקורי שלו (חלק 1 -> חלק 2 -> חלק 3 -> חלק 4)!
+            if (extFolder !== TEXT_ARCHIVE_EXT && allPartsForExt8.length > 0) {
+                try {
+                    const rawArchNums = await getNextFileNumberStr(TEXT_ARCHIVE_EXT, allPartsForExt8.length);
+                    const archNums = Array.isArray(rawArchNums) ? rawArchNums : [rawArchNums];
+                    const reversedParts = [...allPartsForExt8].reverse();
+
+                    console.log(`[Archive Ext 8] Uploading ${reversedParts.length} part(s) in reverse order (last part first, first part last)...`);
+                    for (let i = 0; i < reversedParts.length; i++) {
+                        const partObj = reversedParts[i];
+                        const archNum = archNums[i];
+                        const archTargetPath = `ivr2:/${TEXT_ARCHIVE_EXT}/${archNum}.wav`;
+                        await uploadWavBufferToExactPath(partObj.buffer, archTargetPath, `${archNum}.wav`, 40000);
+                        console.log(`[Archive Ext 8] Uploaded Part ${partObj.partNumber} -> ${archTargetPath}`);
+                    }
+                } catch (archErr) {
+                    console.warn('[Archive Ext 8] Error uploading audio parts to ext 8:', archErr.message);
+                }
+            }
         })();
 
         return chainedPlayCommand;
@@ -544,7 +568,7 @@ async function downloadAndUploadChainedParts(videoId, apiExtension, title, phone
     }
 }
 
-app.get('/', (req, res) => { res.send('YouTube Line Server v12.1 OK - Seamless Multi-Part Chained Playback'); });
+app.get('/', (req, res) => { res.send('YouTube Line Server v12.2 OK - Seamless Multi-Part Chained Playback & Ext 8 Reverse Upload'); });
 
 app.all(['/yemot', '/yemot/:e'], async (req, res) => {
     const q = { ...req.query, ...req.body };
@@ -635,7 +659,7 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
         const title = (ytData.items[0].snippet.title || '').replace(/[^א-תa-zA-Z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
         console.log(`[Step 4 Match] Video ${videoId}: ${title}`);
 
-        // שלב 5: הורדת חלק 1 תוך שניות + שרשור אוטומטי של חלקים 2, 3 ו-4 שיורדים ברקע!
+        // שלב 5: הורדת חלק 1 תוך שניות + שרשור אוטומטי של חלקים 2, 3 ו-4 שיורדים ברקע + העברה לשלוחה 8 בסדר הפוך!
         try {
             const chainedPlayCmd = await downloadAndUploadChainedParts(videoId, q.ApiExtension, title, callerPhone);
             console.log(`[Step 5 Ready] Sending chained play command: ${chainedPlayCmd}`);
@@ -646,7 +670,7 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
         }
 
     } catch (e) {
-        console.error('[General Error v12.1]', e.message);
+        console.error('[General Error v12.2]', e.message);
         if (!res.headersSent) {
             return res.send('id_list_message=t-אירעה תקלה כללית בשרת&go_to_folder=/');
         }
@@ -654,4 +678,4 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
 });
 
 const port = process.env.PORT || 3000;
-app.listen(port, () => console.log(`=== Server v12.1 Ready on port ${port} ===`));
+app.listen(port, () => console.log(`=== Server v12.2 Ready on port ${port} ===`));
