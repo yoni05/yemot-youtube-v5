@@ -1,6 +1,6 @@
 {
   "name": "yemot-youtube-line-v10",
-  "version": "10.0.0",
+  "version": "10.3.0",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
