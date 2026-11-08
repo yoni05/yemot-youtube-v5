@@ -19,6 +19,10 @@ const YM = 'https://www.call2all.co.il/ym/api/';
 
 let cachedModelName = null;
 
+// זיכרון לשמירת ההורדה הקודמת של כל מתקשר (וגם ההורדה האחרונה הכללית בקו)
+const lastDownloadByPhone = new Map();
+let globalLastDownload = null;
+
 async function fetchWithTimeout(url, options = {}, timeout = 20000) {
     const controller = new AbortController();
     const id = setTimeout(() => controller.abort(), timeout);
@@ -32,7 +36,31 @@ async function fetchWithTimeout(url, options = {}, timeout = 20000) {
     }
 }
 
-// 1. הורדת ההקלטה מימות המשיח
+// בירור הקובץ האחרון שקיים בשלוחה בימות המשיח (כדי שלא נדרוס הורדות קודמות וגם נדע מה ההורדה האחרונה אחרי הפעלה מחדש)
+async function getExtensionLatestAudioFile(extFolder) {
+    const folderPath = extFolder ? `ivr2:/${extFolder}` : `ivr2:/`;
+    try {
+        const url = `${YM}GetIVR2Dir?token=${encodeURIComponent(TOKEN)}&path=${encodeURIComponent(folderPath)}`;
+        const res = await fetchWithTimeout(url, {}, 8000);
+        if (res.ok) {
+            const data = await res.json();
+            const files = (data.files || [])
+                .filter(f => f && f.name && /^\d{3,}\.wav$/i.test(f.name))
+                .map(f => parseInt(f.name.replace(/\D/g, ''), 10))
+                .filter(n => !isNaN(n) && n >= 100 && n < 900);
+            if (files.length > 0) {
+                files.sort((a, b) => b - a);
+                const latestNum = String(files[0]).padStart(3, '0');
+                return extFolder ? `f-/${extFolder}/${latestNum}` : `f-/${latestNum}`;
+            }
+        }
+    } catch (e) {
+        console.warn('[Yemot Dir Check] Could not list directory:', e.message);
+    }
+    return null;
+}
+
+// 1. הורדת ההקלטה מימות המשיח (מוחק רק את הקלטת הדיבור הקצרה של המשתמש ולא את השירים/השיעורים שהורדו!)
 async function downloadRecordingFromYemot(recordPath, apiDir) {
     const cleanPath = String(recordPath).replace(/^ivr2:\/*/, '').replace(/^\/*/, '');
     const cleanDir = String(apiDir || '').replace(/^ivr2:\/*/, '').replace(/^\/*/, '').replace(/\/*$/, '');
@@ -66,6 +94,7 @@ async function downloadRecordingFromYemot(recordPath, apiDir) {
             
             if (buf.length > 200 && !headStr.includes('responseStatus') && !headStr.includes('EXCEPTION')) {
                 console.log(`[Yemot Download] Success from ${p} (${buf.length} bytes)`);
+                // מוחקים רק את קובץ הקלטת הבקשה הזמני (כדי שלא יתפוס מספר קובץ של הורדה)
                 fetchWithTimeout(`${YM}FileAction?token=${encodeURIComponent(TOKEN)}&action=delete&what=${encodeURIComponent(p)}`).catch(() => null);
                 return buf;
             } else {
@@ -326,7 +355,6 @@ async function getFallbackAudioUrls(videoId) {
                 const data = await apiRes.json();
                 const formats = (data.adaptiveFormats || []).filter(f => (f.type || '').startsWith('audio/'));
                 if (formats.length > 0) {
-                    // מעדיפים itag=140 או itag=251 על פני itag=139 (שמוגבל במהירות ביוטיוב וגורם להורדת 20 שניות בלבד!)
                     formats.sort((a, b) => {
                         const aIs140 = String(a.itag) === '140' ? 0 : (String(a.itag) === '251' ? 1 : 2);
                         const bIs140 = String(b.itag) === '140' ? 0 : (String(b.itag) === '251' ? 1 : 2);
@@ -353,12 +381,9 @@ async function getFallbackAudioUrls(videoId) {
     return [...new Set(urls)];
 }
 
-// הורדת גיבוי ב-Node.js עם זמן הורדה מורחב (45 שניות במקום 14 שניות שקטעו את השיר ב-20 שניות!)
-// + תמיכה בבקשות Range מרובות (Chunked Range Requests) אם שרת הפרוקסי מחזיר רק נתח ראשוני קטן
 async function downloadViaNodeAndConvertToWav(streamUrl, outputWavPath, maxBytes = 15 * 1024 * 1024) {
     const tmpInput = path.join(os.tmpdir(), `dl_${Date.now()}_${Math.random().toString(36).slice(2)}.audio`);
     const controller = new AbortController();
-    // הגדלת ה-Timeout מ-14 שניות ל-45 שניות כדי שהשיר/השיעור ירד במלואו ולא ייקטע אחרי 130KB (20 שניות)!
     const timeoutId = setTimeout(() => controller.abort(), 45000);
 
     let downloaded = 0;
@@ -395,7 +420,6 @@ async function downloadViaNodeAndConvertToWav(streamUrl, outputWavPath, maxBytes
                 }
             }
         } catch (readErr) {
-            // שומרים את הקובץ החלקי רק אם ירדו לפחות 600KB (למניעת קובץ של 20 שניות בלבד)
             if (downloaded < 600000) throw readErr;
         }
 
@@ -418,13 +442,15 @@ async function downloadViaNodeAndConvertToWav(streamUrl, outputWavPath, maxBytes
     }
 }
 
-// 6. הורדה משולבת (ytdl-core + גיבויי פרוקסי), המרה מקומית והעלאה ישירה לימות המשיח
-async function downloadAndUploadToYemot(videoId, apiExtension) {
+// 6. הורדה, המרה מקומית והעלאה לימות המשיח תוך שמירת כל ההורדות הקודמות בשלוחה!
+// שימוש ב-autoNumbering של ימות המשיח (path=ivr2:/9/ ללא שם קובץ קבוע) או מספור עולה,
+// כך שכל הורדה נשמרת כקובץ חדש בשלוחה (000.wav, 001.wav, 002.wav...) ולא דורסת את ההורדה הקודמת!
+async function downloadAndUploadToYemot(videoId, apiExtension, title, phone) {
     const tmpWav = path.join(os.tmpdir(), `ym_${videoId}_${Date.now()}.wav`);
     const extFolder = String(apiExtension || '9').replace(/^ivr2:\/*/, '').replace(/^\/*/, '').replace(/\/*$/, '');
     
-    const yemotTargetPath = extFolder ? `ivr2:/${extFolder}/100.wav` : `ivr2:/100.wav`;
-    const playFileCommand = extFolder ? `f-/${extFolder}/100` : `f-/100`;
+    // שליחת נתיב התיקייה עם סלאש בסוף גורמת לימות המשיח לתת לקובץ מספר סידורי חדש אוטומטית (ולא לדרוס את הקובץ הקודם!)
+    const yemotTargetDir = extFolder ? `ivr2:/${extFolder}/` : `ivr2:/`;
 
     try {
         let converted = false;
@@ -441,7 +467,7 @@ async function downloadAndUploadToYemot(videoId, apiExtension) {
             console.warn(`[Step 5 Audio] Primary engine failed (${ytdlErr.message}), falling back to Piped/Invidious...`);
         }
 
-        // ניסיון 2: שרתי גיבוי (Piped / Invidious) עם זמן הורדה מלא ועדיפות ל-itag 140
+        // ניסיון 2: שרתי גיבוי (Piped / Invidious)
         if (!converted) {
             const proxyUrls = await getFallbackAudioUrls(videoId);
             for (const pUrl of proxyUrls.slice(0, 8)) {
@@ -464,13 +490,14 @@ async function downloadAndUploadToYemot(videoId, apiExtension) {
         }
 
         const wavBuffer = await fs.promises.readFile(tmpWav);
-        console.log(`[Step 5 Upload] Uploading ${wavBuffer.length} bytes to Yemot (${yemotTargetPath})...`);
+        console.log(`[Step 5 Upload] Uploading ${wavBuffer.length} bytes to Yemot directory (${yemotTargetDir}) with auto-numbering...`);
 
         const formData = new FormData();
         formData.append('token', TOKEN);
-        formData.append('path', yemotTargetPath);
+        formData.append('path', yemotTargetDir);
         formData.append('convertAudio', '0');
-        formData.append('file', new Blob([wavBuffer], { type: 'audio/wav' }), '100.wav');
+        formData.append('autoNumbering', 'true');
+        formData.append('file', new Blob([wavBuffer], { type: 'audio/wav' }), 'audio.wav');
 
         const upRes = await fetchWithTimeout(`${YM}UploadFile`, {
             method: 'POST',
@@ -478,7 +505,36 @@ async function downloadAndUploadToYemot(videoId, apiExtension) {
         }, 35000);
 
         const upText = await upRes.text();
-        console.log('[Step 5 Upload] Yemot response:', upText.slice(0, 200));
+        console.log('[Step 5 Upload] Yemot response:', upText.slice(0, 250));
+
+        // פענוח שם הקובץ החדש שימות המשיח יצר (למשל "ivr/9/005.wav" -> פקודת השמעה "f-/9/005")
+        let playFileCommand = extFolder ? `f-/${extFolder}/100` : `f-/100`;
+        try {
+            const upJson = JSON.parse(upText);
+            if (upJson && upJson.path) {
+                const cleaned = String(upJson.path)
+                    .replace(/^ivr2?:\/*/i, '')
+                    .replace(/^\/*/, '')
+                    .replace(/\.wav$/i, '');
+                playFileCommand = `f-/${cleaned}`;
+            }
+        } catch (parseErr) {}
+
+        // גיבוי: אם מסיבה כלשהי ימות המשיח לא החזיר path ב-JSON, נשמור גם ב-100.wav
+        if (playFileCommand.endsWith('/100') && !upText.includes('00') && !upText.includes('100')) {
+            const fallbackPath = extFolder ? `ivr2:/${extFolder}/100.wav` : `ivr2:/100.wav`;
+            const fbForm = new FormData();
+            fbForm.append('token', TOKEN);
+            fbForm.append('path', fallbackPath);
+            fbForm.append('convertAudio', '0');
+            fbForm.append('file', new Blob([wavBuffer], { type: 'audio/wav' }), '100.wav');
+            await fetchWithTimeout(`${YM}UploadFile`, { method: 'POST', body: fbForm }, 25000).catch(() => null);
+        }
+
+        // שמירת ההורדה בזיכרון עבור המתקשר הנוכחי ועבור הקו כולו
+        const savedInfo = { playCmd: playFileCommand, title: title || 'ההורדה הקודמת', time: Date.now() };
+        if (phone) lastDownloadByPhone.set(phone, savedInfo);
+        globalLastDownload = savedInfo;
 
         fs.promises.unlink(tmpWav).catch(() => null);
         return playFileCommand;
@@ -489,7 +545,7 @@ async function downloadAndUploadToYemot(videoId, apiExtension) {
     }
 }
 
-app.get('/', (req, res) => { res.send('YouTube Line Server v10.3 OK - Full Duration Audio'); });
+app.get('/', (req, res) => { res.send('YouTube Line Server v10.4 OK - Saved Previous Downloads Support'); });
 
 app.all(['/yemot', '/yemot/:e'], async (req, res) => {
     const q = { ...req.query, ...req.body };
@@ -500,9 +556,37 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
     try {
         if (q.hangup === 'yes') return res.send('noop');
 
-        // שלב 1: בקשת הקלטה
+        const extFolder = String(q.ApiExtension || '9').replace(/^ivr2:\/*/, '').replace(/^\/*/, '').replace(/\/*$/, '');
+        const callerPhone = String(q.ApiPhone || '').trim();
+
+        // שלב 0: אם המשתמש עוד לא בחר בתפריט ועדיין לא הקליט
+        if (!q.MenuChoice && !q.RecordPath) {
+            return res.send('read=t-לחיפוש חדש הקישו 1 להאזנה להורדה הקודמת הקישו 2=MenuChoice,no,1,1,7,Digits,no');
+        }
+
+        // אם המשתמש הקיש 2 -> השמעת ההורדה הקודמת מיד ללא צורך בהורדה מחדש!
+        if (q.MenuChoice === '2' && !q.RecordPath) {
+            let prev = (callerPhone && lastDownloadByPhone.get(callerPhone)) || globalLastDownload;
+            if (!prev) {
+                const latestCmd = await getExtensionLatestAudioFile(extFolder);
+                if (latestCmd) {
+                    prev = { playCmd: latestCmd, title: 'ההורדה האחרונה בקו' };
+                }
+            }
+            if (prev && prev.playCmd) {
+                console.log(`[Replay Previous] Playing ${prev.playCmd} (${prev.title}) for ${callerPhone}`);
+                return res.send(`id_list_message=t-משמיע את ${prev.title}.${prev.playCmd}&go_to_folder=/`);
+            } else {
+                // אם אין עדיין שום הורדה קודמת בשלוחה, מעבירים אותו להקלטת חיפוש חדש
+                return res.send('id_list_message=t-עדיין לא קיימת הורדה קודמת בקו&read=t-אנא אמרו את שם השיעור או השיר המבוקש ובסיום הקישו סולמית=RecordPath,no,record,,,no,7,1');
+            }
+        }
+
+        // שלב 1: המשתמש בחר 1 (או כל מקש אחר) -> מבקשים הקלטה של החיפוש החדש
+        // אנו שומרים את ההקלטה הזמנית בתור קובץ שממוספר גבוה (999.wav) כדי שלא תתערבב עם קובצי השירים שנשמרים בשלוחה!
         if (!q.RecordPath) {
-            return res.send('read=t-אנא אמרו את שם השיעור המבוקש ובסיום הקישו סולמית=RecordPath,no,record,,,no,7,1');
+            const tempRecFolder = extFolder ? `/${extFolder}` : '';
+            return res.send(`read=t-אנא אמרו את שם השיעור או השיר המבוקש ובסיום הקישו סולמית=RecordPath,no,record,${tempRecFolder},999,no,7,1`);
         }
 
         // שלב 2: הורדת ההקלטה מימות המשיח
@@ -548,9 +632,9 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
         const title = (ytData.items[0].snippet.title || '').replace(/[^א-תa-zA-Z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
         console.log(`[Step 4 Match] Video ${videoId}: ${title}`);
 
-        // שלב 5: הורדה מלאה, המרה מקומית ל-WAV והעלאה לימות המשיח
+        // שלב 5: הורדה מלאה, המרה מקומית ל-WAV והעלאה לימות המשיח (ללא דריסת קבצים קודמים!)
         try {
-            const playCmd = await downloadAndUploadToYemot(videoId, q.ApiExtension);
+            const playCmd = await downloadAndUploadToYemot(videoId, q.ApiExtension, title, callerPhone);
             console.log(`[Step 5 Ready] Sending play command: ${playCmd}`);
             return res.send(`id_list_message=t-משמיע ${title}.${playCmd}&go_to_folder=/`);
         } catch (audioErr) {
@@ -559,7 +643,7 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
         }
 
     } catch (e) {
-        console.error('[General Error v10.3]', e.message);
+        console.error('[General Error v10.4]', e.message);
         if (!res.headersSent) {
             return res.send('id_list_message=t-אירעה תקלה כללית בשרת&go_to_folder=/');
         }
@@ -567,4 +651,4 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
 });
 
 const port = process.env.PORT || 3000;
-app.listen(port, () => console.log(`=== Server v10.3 Ready on port ${port} ===`));
+app.listen(port, () => console.log(`=== Server v10.4 Ready on port ${port} ===`));
