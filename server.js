@@ -16,12 +16,20 @@ const TOKEN = (process.env.YEMOT_TOKEN || '').trim();
 const GEMINI_KEY = (process.env.GEMINI_API_KEY || '').trim();
 const YT_KEY = (process.env.YOUTUBE_API_KEY || '').trim();
 const YM = 'https://www.call2all.co.il/ym/api/';
-const TEXT_ARCHIVE_EXT = '8'; // שלוחה 8 לשמירת קובצי הטקסט וכל הקבצים שיורדים
+const ADMIN_LOG_EXT = '8';
 
 let cachedModelName = null;
-const lastDownloadByPhone = new Map();
-let globalLastDownload = null;
 const folderCounters = {};
+const userNamesCache = new Map();
+const configuredPlayfileDirs = new Set();
+
+// חילוץ הערך האחרון אם ימות המשיח שולחת מערך של פרמטרים (כמו ["3","3"])
+function lastVal(param) {
+    if (Array.isArray(param)) {
+        return String(param[param.length - 1] || '').trim();
+    }
+    return String(param || '').trim();
+}
 
 async function fetchWithTimeout(url, options = {}, timeout = 20000) {
     const controller = new AbortController();
@@ -36,7 +44,87 @@ async function fetchWithTimeout(url, options = {}, timeout = 20000) {
     }
 }
 
-// איתור המספר הפנוי הבא בתיקייה בימות המשיח (תומך בשריון מספר קבצים עוקבים עבור חלקי השיעור!)
+// בדיקת סטטוס סרטון מול נטפרי
+async function isVideoApprovedByNetFree(videoId) {
+    try {
+        const url = `https://public.netfree.link/api/check-video?v=${encodeURIComponent(videoId)}`;
+        const res = await fetchWithTimeout(url, {
+            headers: { 'User-Agent': 'Mozilla/5.0' }
+        }, 6000);
+        if (res.ok) {
+            const data = await res.json();
+            if (data && (data.status === 'open' || data.status === 'approved' || data.open === true || data.isBlocked === false)) {
+                return true;
+            }
+        }
+        return false;
+    } catch (e) {
+        console.error('[NetFree Check Error]', e.message);
+        return false;
+    }
+}
+
+// בדיקה אם משתמש כבר רשום במערכת
+async function getUserNameIfRegistered(phone) {
+    if (userNamesCache.has(phone)) {
+        return userNamesCache.get(phone);
+    }
+    const folderPath = `ivr2:/users/${phone}`;
+    try {
+        const url = `${YM}GetIVR2Dir?token=${encodeURIComponent(TOKEN)}&path=${encodeURIComponent(folderPath)}`;
+        const res = await fetchWithTimeout(url, {}, 6000);
+        if (res.ok) {
+            const data = await res.json();
+            const files = data.files || [];
+            const hasNameFile = files.some(f => {
+                const fname = (typeof f === 'string') ? f : (f && (f.name || f.fileName || ''));
+                const low = String(fname).toLowerCase();
+                return low === 'name.txt' || low === 'name.wav';
+            });
+            if (hasNameFile) {
+                try {
+                    const dlUrl = `${YM}DownloadFile?token=${encodeURIComponent(TOKEN)}&path=${encodeURIComponent(folderPath + '/name.txt')}`;
+                    const dlRes = await fetchWithTimeout(dlUrl, {}, 5000);
+                    if (dlRes.ok) {
+                        const nameTxt = (await dlRes.text()).trim();
+                        if (nameTxt && !nameTxt.includes('responseStatus') && !nameTxt.includes('EXCEPTION')) {
+                            userNamesCache.set(phone, nameTxt);
+                            return nameTxt;
+                        }
+                    }
+                } catch (e) {}
+                userNamesCache.set(phone, 'משתמש רשום');
+                return 'משתמש רשום';
+            }
+        }
+    } catch (e) {
+        console.warn('[Check User Warning]', e.message);
+    }
+    return null;
+}
+
+// הגדרת תיקייה אישית כשלוחת השמעת קבצים רגילה בימות המשיח (מחוץ לשרת)
+async function ensurePlayfileExtension(folderPathStr) {
+    const clean = String(folderPathStr).replace(/^ivr2:\/*/, '').replace(/^\/*/, '').replace(/\/*$/, '');
+    if (configuredPlayfileDirs.has(clean)) return;
+    try {
+        const body = new URLSearchParams({
+            token: TOKEN,
+            path: `ivr2:/${clean}`,
+            type: 'playfile'
+        });
+        await fetchWithTimeout(`${YM}UpdateExtension`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body
+        }, 7000);
+        configuredPlayfileDirs.add(clean);
+    } catch (e) {
+        console.warn(`[Ensure Playfile ${clean}]`, e.message);
+    }
+}
+
+// איתור המספר הפנוי הבא בתיקייה בימות המשיח
 async function getNextFileNumberStr(folder, reserveCount = 1) {
     const cleanFolder = String(folder || '').replace(/^ivr2:\/*/, '').replace(/^\/*/, '').replace(/\/*$/, '');
     const folderPath = cleanFolder ? `ivr2:/${cleanFolder}` : `ivr2:/`;
@@ -75,33 +163,6 @@ async function getNextFileNumberStr(folder, reserveCount = 1) {
     return reserveCount === 1 ? result[0] : result;
 }
 
-async function getExtensionLatestAudioFile(extFolder) {
-    const cleanFolder = String(extFolder || '').replace(/^ivr2:\/*/, '').replace(/^\/*/, '').replace(/\/*$/, '');
-    const folderPath = cleanFolder ? `ivr2:/${cleanFolder}` : `ivr2:/`;
-    try {
-        const url = `${YM}GetIVR2Dir?token=${encodeURIComponent(TOKEN)}&path=${encodeURIComponent(folderPath)}`;
-        const res = await fetchWithTimeout(url, {}, 7000);
-        if (res.ok) {
-            const data = await res.json();
-            const nums = [];
-            for (const f of (data.files || [])) {
-                const fname = (typeof f === 'string') ? f : (f && (f.name || f.fileName || ''));
-                const m = String(fname).match(/^(\d+)\.wav$/i);
-                if (m) {
-                    const n = parseInt(m[1], 10);
-                    if (!isNaN(n) && n < 900) nums.push(n);
-                }
-            }
-            if (nums.length > 0) {
-                nums.sort((a, b) => b - a);
-                const latestNum = String(nums[0]).padStart(3, '0');
-                return cleanFolder ? `f-/${cleanFolder}/${latestNum}` : `f-/${latestNum}`;
-            }
-        }
-    } catch (e) {}
-    return null;
-}
-
 // העלאת קובץ WAV מוכן לימות המשיח
 async function uploadWavBufferToExactPath(wavBuffer, exactTargetPath, fileNameLabel = 'audio.wav', timeoutMs = 45000) {
     const formData = new FormData();
@@ -120,37 +181,43 @@ async function uploadWavBufferToExactPath(wavBuffer, exactTargetPath, fileNameLa
     return upText;
 }
 
-// שמירת קובץ הטקסט של זיהוי הדיבור (.tts + .txt) בשלוחה 8
-async function saveTranscriptionTextToExt8(transcribedText, callerPhone, recFilePath) {
+// העלאת קובץ טקסט לימות המשיח
+async function uploadTextToExactPath(textContent, exactTargetPath, fileNameLabel = 'file.txt') {
+    const form = new FormData();
+    form.append('token', TOKEN);
+    form.append('path', exactTargetPath);
+    form.append('convertAudio', '0');
+    form.append('file', new Blob([Buffer.from(textContent, 'utf8')], { type: 'text/plain; charset=utf-8' }), fileNameLabel);
+    await fetchWithTimeout(`${YM}UploadFile`, { method: 'POST', body: form }, 12000);
+}
+
+// תיעוד פעולות והורדות למנהל המערכת בשלוחה 8
+async function saveAdminLogToExt8(callerPhone, userName, categoryLabel, searchQuery, downloadedTitle, statusText) {
     try {
-        const nextNum = await getNextFileNumberStr(TEXT_ARCHIVE_EXT, 1);
+        const nextNum = await getNextFileNumberStr(ADMIN_LOG_EXT, 1);
         const nowStr = new Date().toLocaleString('he-IL', { timeZone: 'Asia/Jerusalem' });
         
-        const ttsTargetPath = `ivr2:/${TEXT_ARCHIVE_EXT}/${nextNum}.tts`;
-        const ttsForm = new FormData();
-        ttsForm.append('token', TOKEN);
-        ttsForm.append('path', ttsTargetPath);
-        ttsForm.append('convertAudio', '0');
-        ttsForm.append('file', new Blob([Buffer.from(transcribedText, 'utf8')], { type: 'text/plain; charset=utf-8' }), `${nextNum}.tts`);
+        const ttsSummary = `משתמש ${userName} טלפון ${callerPhone} חיפש ב${categoryLabel} את ${searchQuery}. סטטוס: ${statusText}`;
+        await uploadTextToExactPath(ttsSummary, `ivr2:/${ADMIN_LOG_EXT}/${nextNum}.tts`, `${nextNum}.tts`);
 
-        await fetchWithTimeout(`${YM}UploadFile`, { method: 'POST', body: ttsForm }, 12000);
-        console.log(`[Text Archive Ext 8] Saved TTS text file to ${ttsTargetPath}: "${transcribedText}"`);
+        const txtDetails = [
+            `שם משתמש: ${userName}`,
+            `מספר טלפון: ${callerPhone}`,
+            `קובץ הקלטת שם: ivr2:/users/${callerPhone}/name.wav`,
+            `קטגוריה: ${categoryLabel}`,
+            `מילות חיפוש: ${searchQuery}`,
+            `כותרת סרטון: ${downloadedTitle || 'לא הורד'}`,
+            `סטטוס: ${statusText}`,
+            `זמן פעולה: ${nowStr}`
+        ].join('\r\n') + '\r\n';
 
-        const txtDetails = `טקסט זיהוי דיבור: ${transcribedText}\r\nטלפון מחפש: ${callerPhone || 'לא ידוע'}\r\nזמן חיפוש: ${nowStr}\r\nקובץ הקלטה בשלוחה 9: ${recFilePath || ''}\r\n`;
-        const txtTargetPath = `ivr2:/${TEXT_ARCHIVE_EXT}/${nextNum}.txt`;
-        const txtForm = new FormData();
-        txtForm.append('token', TOKEN);
-        txtForm.append('path', txtTargetPath);
-        txtForm.append('convertAudio', '0');
-        txtForm.append('file', new Blob([Buffer.from(txtDetails, 'utf8')], { type: 'text/plain; charset=utf-8' }), `${nextNum}.txt`);
-
-        await fetchWithTimeout(`${YM}UploadFile`, { method: 'POST', body: txtForm }, 12000);
+        await uploadTextToExactPath(txtDetails, `ivr2:/${ADMIN_LOG_EXT}/${nextNum}.txt`, `${nextNum}.txt`);
     } catch (err) {
-        console.warn('[Text Archive Ext 8] Error saving transcription text:', err.message);
+        console.warn('[Admin Log Ext 8] Error:', err.message);
     }
 }
 
-// 1. הורדת ההקלטה משלוחה 9 (ההקלטה נשמרת בשלוחה 9)
+// הורדת הקלטה מימות המשיח
 async function downloadRecordingFromYemot(recordPath, apiDir) {
     const cleanPath = String(recordPath).replace(/^ivr2:\/*/, '').replace(/^\/*/, '');
     const cleanDir = String(apiDir || '').replace(/^ivr2:\/*/, '').replace(/^\/*/, '').replace(/\/*$/, '');
@@ -193,7 +260,7 @@ async function downloadRecordingFromYemot(recordPath, apiDir) {
     throw new Error('YEMOT_DOWNLOAD_ERR: ' + lastYemotResponse);
 }
 
-// 2. בחירת מודל Gemini מהיר לתמלול
+// בחירת מודל Gemini מהיר לתמלול
 async function getFastGeminiModels() {
     const defaultFastOrder = [
         'gemini-flash-lite-latest',
@@ -276,7 +343,7 @@ async function transcribeAudio(audioBase64) {
     throw new Error('GEMINI_ERR: ' + lastErr);
 }
 
-// 3. חיתוך והמרה מהירה של מקטע ספציפי (startSec עד startSec + durationSec) לקובץ WAV תקני לימות המשיח (8000Hz Mono PCM)
+// חיתוך והמרה מהירה של מקטע ספציפי לקובץ WAV תקני לימות המשיח (8000Hz Mono PCM)
 async function convertSegmentToWavFast(inputPath, outputWavPath, startSec = 0, durationSec = 900) {
     await new Promise((resolve, reject) => {
         const ffTimer = setTimeout(() => reject(new Error('Local FFmpeg segment timeout')), 25000);
@@ -301,7 +368,7 @@ async function convertSegmentToWavFast(inputPath, outputWavPath, startSec = 0, d
     });
 }
 
-// 4. איתור קישורי פרוקסי מהירים (itag=139/249 ששוקלים ~350KB לדקה בלבד!)
+// איתור קישורי פרוקסי מהירים
 async function getFastStreamUrls(videoId) {
     const urls = [];
 
@@ -327,7 +394,6 @@ async function getFastStreamUrls(videoId) {
                         const itag = fmt.itag || 139;
                         urls.push(`${host}/latest_version?id=${videoId}&itag=${itag}&local=true`);
                     }
-                    console.log(`[Fast Audio] Found stream via ${host} (itag ${formats[0].itag})`);
                     if (urls.length >= 2) break;
                 }
             }
@@ -343,7 +409,7 @@ async function getFastStreamUrls(videoId) {
     return [...new Set(urls)];
 }
 
-// 5. הורדה מואצת במקטעים (Chunked Range Download)
+// הורדה מואצת במקטעים
 async function downloadStreamFastToLocalFile(streamUrl, targetFilePath, maxBytes, timeoutMs = 15000) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -393,16 +459,15 @@ async function downloadStreamFastToLocalFile(streamUrl, targetFilePath, maxBytes
     }
 }
 
-// 6. הורדה והשמעה רציפה ללא עצירה לאחר 15 דקות + העברה לשלוחה 8 בסדר הפוך (החלק האחרון נכנס ראשון והחלק הראשון נכנס אחרון)!
-async function downloadAndUploadChainedParts(videoId, apiExtension, title, phone) {
-    const extFolder = String(apiExtension || '9').replace(/^ivr2:\/*/, '').replace(/^\/*/, '').replace(/\/*$/, '');
-    
-    // שריון 4 מספרי קבצים עוקבים עבור 4 חלקי השיעור בשלוחת החיפוש (4 x 15 דקות = 60 דקות רצופות)
-    const partNums = await getNextFileNumberStr(extFolder, 4);
-    const partPaths = partNums.map(num => extFolder ? `ivr2:/${extFolder}/${num}.wav` : `ivr2:/${num}.wav`);
-    const partCmds = partNums.map(num => extFolder ? `f-/${extFolder}/${num}` : `f-/${num}`);
-    
-    // שרשור כל 4 החלקים בפקודת ההשמעה של ימות המשיח
+// הורדה להשמעה מיידית בחיפוש + העברה ברקע לשלוחה האישית (1 או 2) בסדר הפוך כדי שיושמע כסדרו בשלוחת השמעת קבצים רגילה
+async function downloadAndUploadChainedAndArchive(videoId, livePlayFolder, archiveUserFolder, title) {
+    const cleanLive = String(livePlayFolder).replace(/^ivr2:\/*/, '').replace(/^\/*/, '').replace(/\/*$/, '');
+    const cleanArchive = String(archiveUserFolder).replace(/^ivr2:\/*/, '').replace(/^\/*/, '').replace(/\/*$/, '');
+
+    // שריון 4 חלקים להשמעה המיידית בחיפוש
+    const partNums = await getNextFileNumberStr(cleanLive, 4);
+    const partPaths = partNums.map(num => `ivr2:/${cleanLive}/${num}.wav`);
+    const partCmds = partNums.map(num => `f-/${cleanLive}/${num}`);
     const chainedPlayCommand = partCmds.join('.');
 
     const streamUrls = await getFastStreamUrls(videoId);
@@ -411,12 +476,9 @@ async function downloadAndUploadChainedParts(videoId, apiExtension, title, phone
     const tmpQuickWav = path.join(os.tmpdir(), `quick_out_${videoId}_${Date.now()}.wav`);
 
     try {
-        // שלב א' (מיידי): הורדת 5.5MB ראשונים (חלק 1: דקות 0 עד 15) תוך שניות בודדות
         for (const sUrl of streamUrls.slice(0, 6)) {
             try {
-                console.log(`[Part 1 Fast Start] Downloading initial 5.5MB from: ${sUrl.slice(0, 80)}...`);
-                const bytes = await downloadStreamFastToLocalFile(sUrl, tmpQuickInput, 5.5 * 1024 * 1024, 9000);
-                console.log(`[Part 1 Fast Start] Got ${bytes} bytes. Converting Part 1 (0-15m) to WAV...`);
+                await downloadStreamFastToLocalFile(sUrl, tmpQuickInput, 5.5 * 1024 * 1024, 9000);
                 await convertSegmentToWavFast(tmpQuickInput, tmpQuickWav, 0, 900);
                 if (fs.existsSync(tmpQuickWav) && fs.statSync(tmpQuickWav).size > 20000) {
                     workingUrl = sUrl;
@@ -427,9 +489,7 @@ async function downloadAndUploadChainedParts(videoId, apiExtension, title, phone
             }
         }
 
-        // גיבוי דרך ytdl-core אם הפרוקסי התעכב
         if (!workingUrl) {
-            console.log('[Part 1 Fast Start] Trying ytdl-core fast 5.5MB...');
             await new Promise((resolve, reject) => {
                 let dl = 0;
                 const ws = fs.createWriteStream(tmpQuickInput);
@@ -450,31 +510,22 @@ async function downloadAndUploadChainedParts(videoId, apiExtension, title, phone
             await convertSegmentToWavFast(tmpQuickInput, tmpQuickWav, 0, 900);
         }
 
-        // העלאת חלק 1 (0-15 דקות) לקובץ הראשון בשלוחה 9 (partPaths[0])
+        // העלאת החלק הראשון להשמעה המיידית בחיפוש
         const quickWavBuf = await fs.promises.readFile(tmpQuickWav);
         await uploadWavBufferToExactPath(quickWavBuf, partPaths[0], `${partNums[0]}.wav`, 20000);
-
-        const savedInfo = { playCmd: chainedPlayCommand, title: title || 'השיעור הקודם', time: Date.now() };
-        if (phone) lastDownloadByPhone.set(phone, savedInfo);
-        globalLastDownload = savedInfo;
 
         fs.promises.unlink(tmpQuickInput).catch(() => null);
         fs.promises.unlink(tmpQuickWav).catch(() => null);
 
-        // שלב ב' (ברקע בזמן שהמאזין מקשיב לחלק 1):
-        // מוריד את הקובץ המלא, מייצר את חלקים 2, 3 ו-4 לשלוחה 9,
-        // ולאחר מכן מעביר את כל החלקים לשלוחה 8 מהסוף להתחלה (החלק האחרון נכנס ראשון והחלק הראשון נכנס אחרון)!
+        // תהליך רקע: הורדת המשך הקובץ + העלאת כל החלקים לשלוחה האישית (1 או 2) בסדר הפוך
         (async () => {
             const tmpFullIn = path.join(os.tmpdir(), `full_in_${videoId}_${Date.now()}.audio`);
-            // מערך לשמירת כל החלקים של ההורדה הנוכחית לפי הסדר (חלק 1 כבר בפנים)
-            const allPartsForExt8 = [
+            const allPartsForArchive = [
                 { partNumber: 1, buffer: quickWavBuf }
             ];
 
             try {
-                console.log(`[Background Parts 2-4] Downloading full audio stream for parts ${partNums.slice(1).join(', ')}...`);
                 let fullBytes = 0;
-
                 if (workingUrl) {
                     fullBytes = await downloadStreamFastToLocalFile(workingUrl, tmpFullIn, 26 * 1024 * 1024, 55000);
                 } else {
@@ -496,13 +547,10 @@ async function downloadAndUploadChainedParts(videoId, apiExtension, title, phone
                     });
                 }
 
-                console.log(`[Background Parts 2-4] Full stream downloaded (${fullBytes} bytes). Splitting into sequential 15-min parts...`);
-
-                // חיתוך והעלאה של חלקים 2, 3 ו-4 (דקות 15-30, 30-45, 45-60)
                 const segments = [
-                    { index: 1, start: 900, duration: 900, label: 'Part 2 (15m-30m)' },
-                    { index: 2, start: 1800, duration: 900, label: 'Part 3 (30m-45m)' },
-                    { index: 3, start: 2700, duration: 900, label: 'Part 4 (45m-60m)' }
+                    { index: 1, start: 900, duration: 900 },
+                    { index: 2, start: 1800, duration: 900 },
+                    { index: 3, start: 2700, duration: 900 }
                 ];
 
                 for (const seg of segments) {
@@ -511,20 +559,16 @@ async function downloadAndUploadChainedParts(videoId, apiExtension, title, phone
                         await convertSegmentToWavFast(tmpFullIn, tmpPartWav, seg.start, seg.duration);
                         if (fs.existsSync(tmpPartWav)) {
                             const stat = fs.statSync(tmpPartWav);
-                            // אם החלק מכיל תוכן ממשי (מעל 5 שניות שמע = ~80KB), נעלה אותו לשלוחה 9 ונוסיף לרשימת ההעברה לשלוחה 8
                             if (stat.size > 80000) {
                                 const partBuf = await fs.promises.readFile(tmpPartWav);
                                 await uploadWavBufferToExactPath(partBuf, partPaths[seg.index], `${partNums[seg.index]}.wav`, 40000);
-                                console.log(`[Background ${seg.label}] Uploaded successfully to ${partPaths[seg.index]} (${partBuf.length} bytes)!`);
-                                allPartsForExt8.push({ partNumber: seg.index + 1, buffer: partBuf });
+                                allPartsForArchive.push({ partNumber: seg.index + 1, buffer: partBuf });
                             } else {
-                                console.log(`[Background ${seg.label}] Lesson ended before ${seg.start}s, skipping remaining parts.`);
                                 fs.promises.unlink(tmpPartWav).catch(() => null);
                                 break;
                             }
                         }
                     } catch (segErr) {
-                        console.log(`[Background ${seg.label}] Reached end of audio or error:`, segErr.message);
                         fs.promises.unlink(tmpPartWav).catch(() => null);
                         break;
                     }
@@ -536,26 +580,22 @@ async function downloadAndUploadChainedParts(videoId, apiExtension, title, phone
                 fs.promises.unlink(tmpFullIn).catch(() => null);
             }
 
-            // העברת כל הקבצים שירדו לשלוחה 8 בסדר הפוך:
-            // החלק האחרון נכנס ראשון לשלוחה 8 (מקבל את המספר הנמוך יותר) והחלק הראשון נכנס אחרון (מקבל את המספר הגבוה ביותר),
-            // כך שכשנכנסים לשלוחה 8 (שמשמיעה קבצים מהחדש לישן), הקובץ יושמע בדיוק לפי הסדר המקורי שלו (חלק 1 -> חלק 2 -> חלק 3 -> חלק 4)!
-            if (extFolder !== TEXT_ARCHIVE_EXT && allPartsForExt8.length > 0) {
-                try {
-                    const rawArchNums = await getNextFileNumberStr(TEXT_ARCHIVE_EXT, allPartsForExt8.length);
-                    const archNums = Array.isArray(rawArchNums) ? rawArchNums : [rawArchNums];
-                    const reversedParts = [...allPartsForExt8].reverse();
+            // העלאת כל החלקים לשלוחה האישית (שלוחה 1 או 2) בסדר הפוך כך שיושמעו מהתחלה לסוף בשלוחת השמעת קבצים רגילה
+            try {
+                await ensurePlayfileExtension(cleanArchive);
+                const rawArchNums = await getNextFileNumberStr(cleanArchive, allPartsForArchive.length);
+                const archNums = Array.isArray(rawArchNums) ? rawArchNums : [rawArchNums];
+                const reversedParts = [...allPartsForArchive].reverse();
 
-                    console.log(`[Archive Ext 8] Uploading ${reversedParts.length} part(s) in reverse order (last part first, first part last)...`);
-                    for (let i = 0; i < reversedParts.length; i++) {
-                        const partObj = reversedParts[i];
-                        const archNum = archNums[i];
-                        const archTargetPath = `ivr2:/${TEXT_ARCHIVE_EXT}/${archNum}.wav`;
-                        await uploadWavBufferToExactPath(partObj.buffer, archTargetPath, `${archNum}.wav`, 40000);
-                        console.log(`[Archive Ext 8] Uploaded Part ${partObj.partNumber} -> ${archTargetPath}`);
-                    }
-                } catch (archErr) {
-                    console.warn('[Archive Ext 8] Error uploading audio parts to ext 8:', archErr.message);
+                for (let i = 0; i < reversedParts.length; i++) {
+                    const partObj = reversedParts[i];
+                    const archNum = archNums[i];
+                    const archTargetPath = `ivr2:/${cleanArchive}/${archNum}.wav`;
+                    await uploadWavBufferToExactPath(partObj.buffer, archTargetPath, `${archNum}.wav`, 40000);
                 }
+                console.log(`[Archive Complete] Uploaded ${reversedParts.length} parts to ivr2:/${cleanArchive}`);
+            } catch (archErr) {
+                console.warn('[Archive Upload Error]:', archErr.message);
             }
         })();
 
@@ -568,7 +608,9 @@ async function downloadAndUploadChainedParts(videoId, apiExtension, title, phone
     }
 }
 
-app.get('/', (req, res) => { res.send('YouTube Line Server v12.2 OK - Seamless Multi-Part Chained Playback & Ext 8 Reverse Upload'); });
+const MAIN_MENU_TEXT = 'לשמיעת הפלייליסט שלכם הקישו 1 לשמיעת שיעורי התורה שלכם הקישו 2 לחיפוש מוזיקה חדש הקישו 3 לחיפוש שיעור חדש הקישו 4 שימו לב כי הקבצים מתעדכנים בשלוחה אחת ושתים רק לאחר כחצי דקה משמיעת הקובץ בחיפוש לפי אורך הקובץ';
+
+app.get('/', (req, res) => { res.send('YouTube Personal Line Server v14.0 (Fixed Loop & External Ext 1/2) OK'); });
 
 app.all(['/yemot', '/yemot/:e'], async (req, res) => {
     const q = { ...req.query, ...req.body };
@@ -579,98 +621,155 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
     try {
         if (q.hangup === 'yes') return res.send('noop');
 
-        const extFolder = String(q.ApiExtension || '9').replace(/^ivr2:\/*/, '').replace(/^\/*/, '').replace(/\/*$/, '');
-        const callerPhone = String(q.ApiPhone || '').trim();
-
-        // שלב 0: תפריט פתיחה בשלוחה 9
-        if (!q.MenuChoice && !q.RecordPath) {
-            return res.send('read=t-לחיפוש חדש הקישו 1 להאזנה להורדה הקודמת הקישו 2=MenuChoice,no,1,1,7,Digits,no');
+        const callerPhone = lastVal(q.ApiPhone).replace(/[^0-9]/g, '');
+        if (!callerPhone) {
+            return res.send('id_list_message=t-שגיאה בזיהוי מספר הטלפון&go_to_folder=/');
         }
 
-        // הקשה על 2 -> השמעת ההורדה הקודמת (כולל כל החלקים המשורשרים שלה ברצף!)
-        if (q.MenuChoice === '2' && !q.RecordPath) {
-            let prev = (callerPhone && lastDownloadByPhone.get(callerPhone)) || globalLastDownload;
-            if (!prev) {
-                const latestCmd = await getExtensionLatestAudioFile(extFolder);
-                if (latestCmd) {
-                    prev = { playCmd: latestCmd, title: 'ההורדה האחרונה בקו' };
+        const menuChoice = lastVal(q.MenuChoice);
+        const searchMusic = lastVal(q.SearchMusic);
+        const searchTorah = lastVal(q.SearchTorah);
+        const recordName = lastVal(q.RecordName);
+
+        const userFolder = `users/${callerPhone}`;
+        const tempRecFolder = `users/${callerPhone}/temp`;
+        // שלוחות 1 ו-2 הרגילות בימות המשיח (לכל מאזין תת-תיקייה לפי מספר הטלפון שלו בתוך שלוחה 1 ו-2)
+        const musicExtFolder = `1/${callerPhone}`;
+        const torahExtFolder = `2/${callerPhone}`;
+
+        // --- עדיפות 1: אם המשתמש כבר הקליט חיפוש מוזיקה או שיעור תורה ---
+        if (searchMusic || searchTorah) {
+            const isMusic = Boolean(searchMusic);
+            const recordPath = searchMusic || searchTorah;
+            const archiveFolder = isMusic ? musicExtFolder : torahExtFolder;
+            const categoryFilter = isMusic ? 'מוזיקה חסידית קודש' : 'שיעור תורה';
+            const categoryLabel = isMusic ? 'מוזיקה' : 'שיעורי תורה';
+            const registeredName = (await getUserNameIfRegistered(callerPhone)) || 'משתמש רשום';
+
+            let audioBuf;
+            try {
+                audioBuf = await downloadRecordingFromYemot(recordPath, lastVal(q.ApiExtension));
+            } catch (dlErr) {
+                return res.send('id_list_message=t-שגיאה בהורדת ההקלטה מימות המשיח&go_to_folder=/');
+            }
+
+            let rawText = '';
+            try {
+                rawText = await transcribeAudio(audioBuf.toString('base64'));
+            } catch (gemErr) {
+                return res.send('id_list_message=t-שגיאה בתקשורת עם מנוע זיהוי הדיבור&go_to_folder=/');
+            }
+
+            const cleanQuery = rawText.replace(/[^א-תa-zA-Z0-9\s]/g, ' ').trim().replace(/\s+/g, ' ');
+            if (!cleanQuery) {
+                return res.send('id_list_message=t-לא הצלחתי לשמוע את הבקשה אנא נסו שנית&go_to_folder=/');
+            }
+
+            const finalQuery = `${cleanQuery} ${categoryFilter}`;
+            const ytUrl = `https://www.googleapis.com/youtube/v3/search?part=snippet&q=${encodeURIComponent(finalQuery)}&type=video&maxResults=5&key=${YT_KEY}`;
+            const ytRes = await fetchWithTimeout(ytUrl, {}, 8000);
+            const ytData = await ytRes.json();
+
+            if (!ytRes.ok) {
+                return res.send('id_list_message=t-שגיאה במפתח החיפוש&go_to_folder=/');
+            }
+
+            if (!ytData.items || ytData.items.length === 0) {
+                saveAdminLogToExt8(callerPhone, registeredName, categoryLabel, cleanQuery, '', 'לא נמצאו תוצאות');
+                return res.send(`id_list_message=t-לא נמצאו תוצאות עבור ${cleanQuery}&go_to_folder=/`);
+            }
+
+            // בדיקת התוצאות מול סינון נטפרי
+            let approvedVideoId = null;
+            let approvedTitle = '';
+
+            for (const item of ytData.items) {
+                const vid = item.id && item.id.videoId;
+                if (!vid) continue;
+                const isApproved = await isVideoApprovedByNetFree(vid);
+                if (isApproved) {
+                    approvedVideoId = vid;
+                    approvedTitle = (item.snippet.title || '').replace(/[^א-תa-zA-Z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
+                    break;
                 }
             }
-            if (prev && prev.playCmd) {
-                console.log(`[Replay Previous] Playing ${prev.playCmd} (${prev.title}) for ${callerPhone}`);
-                return res.send(`id_list_message=t-משמיע את ${prev.title}.${prev.playCmd}&go_to_folder=/`);
-            } else {
-                const recNum = await getNextFileNumberStr(extFolder, 1);
-                const recFolder = extFolder ? `/${extFolder}` : '';
-                return res.send(`id_list_message=t-עדיין לא קיימת הורדה קודמת בקו&read=t-אנא אמרו את שם השיעור המבוקש ובסיום הקישו סולמית=RecordPath,no,record,${recFolder},${recNum},no,7,1`);
+
+            if (!approvedVideoId) {
+                saveAdminLogToExt8(callerPhone, registeredName, categoryLabel, cleanQuery, '', 'נחסם - לא מאושר בנטפרי');
+                return res.send('id_list_message=t-הסרטון אינו נמצא יתכן שחיפשתם תוכן שאינו ראוי שימו לב לאחר כמה נסיונות לתוכן כזה תיחסמו מהמערכת&go_to_folder=/');
+            }
+
+            // הורדה להשמעה מיידית + העברה ברקע לשלוחה 1 או 2 הרגילות בימות המשיח
+            try {
+                const chainedPlayCmd = await downloadAndUploadChainedAndArchive(approvedVideoId, tempRecFolder, archiveFolder, approvedTitle);
+                saveAdminLogToExt8(callerPhone, registeredName, categoryLabel, cleanQuery, approvedTitle, `הורד בהצלחה לשלוחה ${archiveFolder}`);
+                return res.send(`id_list_message=t-משמיע ${approvedTitle}.${chainedPlayCmd}&go_to_folder=/`);
+            } catch (audioErr) {
+                console.error('[Download Error]', audioErr.message);
+                return res.send(`id_list_message=t-נמצא ${approvedTitle} אך אירעה שגיאה בטעינת הקובץ&go_to_folder=/`);
             }
         }
 
-        // שלב 1: הקלטת החיפוש בקולו של המשתמש בשלוחה 9
-        if (!q.RecordPath) {
-            const recNum = await getNextFileNumberStr(extFolder, 1);
-            const recFolder = extFolder ? `/${extFolder}` : '';
-            return res.send(`read=t-אנא אמרו את שם השיעור המבוקש ובסיום הקישו סולמית=RecordPath,no,record,${recFolder},${recNum},no,7,1`);
+        // --- עדיפות 2: אם המשתמש הקיש בחירה בתפריט (1, 2, 3 או 4) ---
+        // בדיקה זו רצה לפני RecordName כדי למנוע את הלולאה שבה ימות המשיח שולחת שוב את RecordName מהשלב הקודם!
+        if (menuChoice) {
+            if (menuChoice === '1') {
+                await ensurePlayfileExtension(musicExtFolder);
+                return res.send(`go_to_folder=/${musicExtFolder}`);
+            }
+            if (menuChoice === '2') {
+                await ensurePlayfileExtension(torahExtFolder);
+                return res.send(`go_to_folder=/${torahExtFolder}`);
+            }
+            if (menuChoice === '3') {
+                const recNum = await getNextFileNumberStr(tempRecFolder, 1);
+                return res.send(`read=t-אנא אמרו את שם השיר המבוקש ובסיום הקישו סולמית=SearchMusic,no,record,/${tempRecFolder},${recNum},no,7,1`);
+            }
+            if (menuChoice === '4') {
+                const recNum = await getNextFileNumberStr(tempRecFolder, 1);
+                return res.send(`read=t-אנא אמרו את שם השיעור המבוקש ובסיום הקישו סולמית=SearchTorah,no,record,/${tempRecFolder},${recNum},no,7,1`);
+            }
+            return res.send(`id_list_message=t-בחירה שגויה&read=t-${MAIN_MENU_TEXT}=MenuChoice,no,1,1,7,Digits,no`);
         }
 
-        // שלב 2: הורדת ההקלטה משלוחה 9
-        let audioBuf;
-        try {
-            audioBuf = await downloadRecordingFromYemot(q.RecordPath, q.ApiExtension);
-        } catch (dlErr) {
-            console.error('[Step 2 Error]', dlErr.message);
-            return res.send('id_list_message=t-שגיאה בהורדת ההקלטה מימות המשיח&go_to_folder=/');
+        // --- עדיפות 3: טיפול בהקלטת שם של משתמש חדש (רק אם טרם נבחרה שלוחה בתפריט) ---
+        if (recordName) {
+            let audioBuf;
+            try {
+                audioBuf = await downloadRecordingFromYemot(recordName, lastVal(q.ApiExtension));
+            } catch (dlErr) {
+                return res.send('id_list_message=t-שגיאה בקליטת ההקלטה אנא נסו שנית&go_to_folder=/');
+            }
+
+            let rawName = '';
+            try {
+                rawName = await transcribeAudio(audioBuf.toString('base64'));
+            } catch (e) {}
+            const cleanName = rawName.replace(/[^א-תa-zA-Z0-9\s]/g, ' ').trim().replace(/\s+/g, ' ') || 'משתמש רשום';
+
+            await uploadWavBufferToExactPath(audioBuf, `ivr2:/${userFolder}/name.wav`, 'name.wav');
+            await uploadTextToExactPath(cleanName, `ivr2:/${userFolder}/name.txt`, 'name.txt');
+            userNamesCache.set(callerPhone, cleanName);
+
+            await ensurePlayfileExtension(musicExtFolder);
+            await ensurePlayfileExtension(torahExtFolder);
+
+            saveAdminLogToExt8(callerPhone, cleanName, 'רישום למערכת', 'הקלטת שם משתמש', '', 'נרשם בהצלחה');
+
+            return res.send(`id_list_message=t-שלום ${cleanName} נרשמתם בהצלחה&read=t-${MAIN_MENU_TEXT}=MenuChoice,no,1,1,7,Digits,no`);
         }
 
-        // שלב 3: זיהוי דיבור מהיר ב-Gemini
-        let rawText = '';
-        try {
-            rawText = await transcribeAudio(audioBuf.toString('base64'));
-        } catch (gemErr) {
-            console.error('[Step 3 Error]', gemErr.message);
-            return res.send('id_list_message=t-שגיאה בתקשורת עם מנוע זיהוי הדיבור&go_to_folder=/');
+        // --- עדיפות 4: כניסה ראשונית לשלוחה (בדיקה אם המשתמש רשום) ---
+        const registeredName = await getUserNameIfRegistered(callerPhone);
+        if (!registeredName) {
+            return res.send(`read=t-ברוכים הבאים אנא הקליטו את שמכם המלא ובסיום הקישו סולמית=RecordName,no,record,/${tempRecFolder},name_rec,no,7,1`);
         }
 
-        const cleanQuery = rawText.replace(/[^א-תa-zA-Z0-9\s]/g, ' ').trim().replace(/\s+/g, ' ');
-        console.log('[Step 3 Clean Query]', cleanQuery);
-
-        if (!cleanQuery) {
-            return res.send('id_list_message=t-לא הצלחתי לשמוע את הבקשה אנא נסו שנית&go_to_folder=/');
-        }
-
-        // שמירת קובץ הטקסט של זיהוי הדיבור (.tts + .txt) בשלוחה 8
-        saveTranscriptionTextToExt8(cleanQuery, callerPhone, q.RecordPath);
-
-        // שלב 4: חיפוש התוצאה
-        const ytUrl = `https://www.googleapis.com/youtube/v3/search?part=snippet&q=${encodeURIComponent(cleanQuery)}&type=video&maxResults=1&key=${YT_KEY}`;
-        const ytRes = await fetchWithTimeout(ytUrl, {}, 8000);
-        const ytData = await ytRes.json();
-
-        if (!ytRes.ok) {
-            console.error('[Step 4 Error]', JSON.stringify(ytData));
-            return res.send('id_list_message=t-שגיאה במפתח החיפוש&go_to_folder=/');
-        }
-
-        if (!ytData.items || ytData.items.length === 0) {
-            return res.send(`id_list_message=t-לא נמצאו תוצאות עבור ${cleanQuery}&go_to_folder=/`);
-        }
-
-        const videoId = ytData.items[0].id.videoId;
-        const title = (ytData.items[0].snippet.title || '').replace(/[^א-תa-zA-Z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
-        console.log(`[Step 4 Match] Video ${videoId}: ${title}`);
-
-        // שלב 5: הורדת חלק 1 תוך שניות + שרשור אוטומטי של חלקים 2, 3 ו-4 שיורדים ברקע + העברה לשלוחה 8 בסדר הפוך!
-        try {
-            const chainedPlayCmd = await downloadAndUploadChainedParts(videoId, q.ApiExtension, title, callerPhone);
-            console.log(`[Step 5 Ready] Sending chained play command: ${chainedPlayCmd}`);
-            return res.send(`id_list_message=t-משמיע ${title}.${chainedPlayCmd}&go_to_folder=/`);
-        } catch (audioErr) {
-            console.error('[Step 5 Error]', audioErr.message);
-            return res.send(`id_list_message=t-נמצא ${title} אך אירעה שגיאה בטעינת הקובץ&go_to_folder=/`);
-        }
+        // משתמש רשום -> השמעת התפריט המבוקש
+        return res.send(`read=t-${MAIN_MENU_TEXT}=MenuChoice,no,1,1,7,Digits,no`);
 
     } catch (e) {
-        console.error('[General Error v12.2]', e.message);
+        console.error('[General Error v14.0]', e.message);
         if (!res.headersSent) {
             return res.send('id_list_message=t-אירעה תקלה כללית בשרת&go_to_folder=/');
         }
@@ -678,4 +777,4 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
 });
 
 const port = process.env.PORT || 3000;
-app.listen(port, () => console.log(`=== Server v12.2 Ready on port ${port} ===`));
+app.listen(port, () => console.log(`=== Server v14.0 Ready on port ${port} ===`));
